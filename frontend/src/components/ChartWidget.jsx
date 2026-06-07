@@ -47,7 +47,7 @@ function makeChart(container, height, showTimeAxis = false) {
       borderColor: 'rgba(255,255,255,0.08)',
       visible: true,
       scaleMargins: { top: 0.1, bottom: 0.1 },
-      minimumWidth: 80,
+      minimumWidth: 90,
     },
     leftPriceScale: { visible: false },
     timeScale: {
@@ -73,6 +73,30 @@ function syncCharts(charts) {
       charts.forEach((dst, di) => {
         if (di !== si) dst.timeScale().setVisibleLogicalRange(range);
       });
+    });
+  });
+}
+
+// ─── Sync crosshair timeline cursor across panes ──────────────────────────────
+function syncCrosshairs(charts, seriesList) {
+  let isSyncing = false;
+  charts.forEach((src, si) => {
+    src.subscribeCrosshairMove(param => {
+      if (isSyncing) return;
+      isSyncing = true;
+      try {
+        const time = param.time;
+        charts.forEach((dst, di) => {
+          if (di !== si) {
+            if (!time || !param.point) {
+              dst.setCrosshairPosition(null, null, seriesList[di]);
+            } else {
+              dst.setCrosshairPosition(null, time, seriesList[di]);
+            }
+          }
+        });
+      } catch (_) {}
+      isSyncing = false;
     });
   });
 }
@@ -156,8 +180,18 @@ export default function ChartWidget() {
     const vwapLine    = mainChart.addSeries(LineSeries, { color: '#ec4899', lineWidth: 2, lineStyle: 1, priceLineVisible: false, lastValueVisible: false });
 
     // RSI pane
-    rsiChart.applyOptions({ rightPriceScale: { autoScale: false } });
-    const rsiLine = rsiChart.addSeries(LineSeries, { color: '#fbbf24', lineWidth: 2, priceLineVisible: false, lastValueVisible: true });
+    const rsiLine = rsiChart.addSeries(LineSeries, {
+      color: '#fbbf24',
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: true,
+      autoscaleInfoProvider: () => ({
+        priceRange: {
+          minValue: 0,
+          maxValue: 100,
+        },
+      }),
+    });
     const rsi70   = rsiChart.addSeries(LineSeries, { color: 'rgba(239,68,68,0.4)',   lineWidth: 1, lineStyle: 3, priceLineVisible: false, lastValueVisible: false });
     const rsi50   = rsiChart.addSeries(LineSeries, { color: 'rgba(148,163,184,0.3)', lineWidth: 1, lineStyle: 3, priceLineVisible: false, lastValueVisible: false });
     const rsi30   = rsiChart.addSeries(LineSeries, { color: 'rgba(16,185,129,0.4)',  lineWidth: 1, lineStyle: 3, priceLineVisible: false, lastValueVisible: false });
@@ -183,6 +217,10 @@ export default function ChartWidget() {
     };
 
     syncCharts([mainChart, rsiChart, macdChart, atrChart]);
+    syncCrosshairs(
+      [mainChart, rsiChart, macdChart, atrChart],
+      [candleSeries, rsiLine, macdLine, atrLine]
+    );
 
     // Resize — wrap in rAF to avoid ResizeObserver loop warnings
     const handleResize = () => {
@@ -337,34 +375,30 @@ export default function ChartWidget() {
       });
 
       // Stop Loss level line
-      if (botConfig?.stopLossPercent > 0) {
-        const slPrice = isLong 
-          ? entryPrice * (1 - botConfig.stopLossPercent / 100)
-          : entryPrice * (1 + botConfig.stopLossPercent / 100);
-        
+      const slPrice = pos.stop_loss_price;
+      if (slPrice !== undefined && slPrice !== null && slPrice > 0) {
+        const pctLabel = pos.stop_loss_percent !== undefined && pos.stop_loss_percent !== null ? ` (${pos.stop_loss_percent}%)` : '';
         slLineRef.current = candleSeries.createPriceLine({
           price: slPrice,
           color: '#ef4444', // Red
           lineWidth: 1.5,
           lineStyle: 2, // Dashed
           axisLabelVisible: true,
-          title: `SL (${botConfig.stopLossPercent}%)`,
+          title: `SL${pctLabel}`,
         });
       }
 
       // Take Profit level line
-      if (botConfig?.takeProfitPercent > 0) {
-        const tpPrice = isLong 
-          ? entryPrice * (1 + botConfig.takeProfitPercent / 100)
-          : entryPrice * (1 - botConfig.takeProfitPercent / 100);
-        
+      const tpPrice = pos.take_profit_price;
+      if (tpPrice !== undefined && tpPrice !== null && tpPrice > 0) {
+        const pctLabel = pos.take_profit_percent !== undefined && pos.take_profit_percent !== null ? ` (${pos.take_profit_percent}%)` : '';
         tpLineRef.current = candleSeries.createPriceLine({
           price: tpPrice,
           color: '#10b981', // Green
           lineWidth: 1.5,
           lineStyle: 2, // Dashed
           axisLabelVisible: true,
-          title: `TP (${botConfig.takeProfitPercent}%)`,
+          title: `TP${pctLabel}`,
         });
       }
     }
