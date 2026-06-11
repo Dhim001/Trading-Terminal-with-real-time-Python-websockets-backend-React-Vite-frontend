@@ -1,26 +1,57 @@
+import { useStore } from '../store/useStore';
+
 let ws = null;
 let reconnectTimeout = null;
+let isConnecting = false;
+let lastUrl = null;
+let lastStoreActions = null;
+
+const clearReconnect = () => {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+};
 
 export const connectWebSocket = (url, storeActions) => {
+  lastUrl = url;
+  lastStoreActions = storeActions;
+
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
     return;
   }
+  if (isConnecting) {
+    return;
+  }
 
+  clearReconnect();
+  isConnecting = true;
   console.log("WebSocket connecting to:", url);
   ws = new WebSocket(url);
 
   ws.onopen = () => {
+    isConnecting = false;
     console.log("WebSocket connected successfully.");
     storeActions.setConnectionStatus('connected');
+    const activeSymbol = useStore.getState().activeSymbol;
+    ws.send(JSON.stringify({ action: "subscribe_symbol", symbol: activeSymbol }));
   };
 
   ws.onclose = () => {
+    isConnecting = false;
+    ws = null;
     console.log("WebSocket disconnected. Retrying in 3s...");
     storeActions.setConnectionStatus('disconnected');
-    reconnectTimeout = setTimeout(() => connectWebSocket(url, storeActions), 3000);
+    clearReconnect();
+    reconnectTimeout = setTimeout(() => {
+      if (lastUrl && lastStoreActions) {
+        connectWebSocket(lastUrl, lastStoreActions);
+      }
+    }, 3000);
   };
 
   ws.onerror = (error) => {
+    isConnecting = false;
     console.error("WebSocket transport error:", error);
   };
 
@@ -54,11 +85,21 @@ export const connectWebSocket = (url, storeActions) => {
         case 'bot_log':
           storeActions.addBotLog(data);
           break;
+        case 'bot_logs_history':
+          storeActions.setBotLogs(data);
+          break;
         case 'bots_update':
           storeActions.setBots(data);
           break;
         case 'system_stats':
           storeActions.setSystemStats(data);
+          break;
+        case 'backtest_result':
+          if (data.status === 'success') {
+            storeActions.setBacktestResults(data.results);
+          } else {
+            console.error("Backtest failed:", data.message);
+          }
           break;
         case 'error':
           console.error("Server execution error:", payload.message);
@@ -73,9 +114,8 @@ export const connectWebSocket = (url, storeActions) => {
 };
 
 export const disconnectWebSocket = () => {
-  if (reconnectTimeout) {
-    clearTimeout(reconnectTimeout);
-  }
+  clearReconnect();
+  isConnecting = false;
   if (ws) {
     ws.onclose = null;
     ws.close();
@@ -91,3 +131,9 @@ export const sendWebSocketAction = (action, payload = {}) => {
   console.warn("Cannot transmit message. WebSocket is offline.");
   return false;
 };
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    disconnectWebSocket();
+  });
+}

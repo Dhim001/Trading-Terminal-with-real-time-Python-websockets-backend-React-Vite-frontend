@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { subscribeWithSelector } from 'zustand/middleware';
 
 const getLocal = (key, fallback) => {
   try {
@@ -15,7 +16,7 @@ const setLocal = (key, val) => {
   } catch (_) {}
 };
 
-export const useStore = create((set, get) => ({
+export const useStore = create(subscribeWithSelector((set, get) => ({
   connectionStatus: 'disconnected',
   activeSymbol: getLocal('terminal_active_symbol', 'BTCUSDT'),
   viewMode: getLocal('terminal_view_mode', 'single'),
@@ -50,12 +51,26 @@ export const useStore = create((set, get) => ({
     allocation: 1000,      // Default capital allocation
   }),
   botLogs: [],             // array of bot operation log strings
+  
+  // Advanced UX States
+  backtestResults: null,
+  chartInteractionMode: 'normal', // 'normal' | 'edit_sl' | 'edit_tp'
+  strategyTemplates: [
+    { id: 't1', name: 'Bull Market Scalper', strategy: 'MACD_RSI', allocation: 2000, config: { rsi_length: 14, macd_fast: 12, macd_slow: 26, trailing_stop_percent: 1.5 } },
+    { id: 't2', name: 'Trend Follower', strategy: 'SUPERTREND', allocation: 5000, config: { st_length: 14, st_multiplier: 3, trailing_stop_percent: 3 } },
+    { id: 't3', name: 'Mean Reversion', strategy: 'BB_STOCH', allocation: 1000, config: { bb_length: 20, bb_std: 2, trailing_stop_percent: 1 } },
+  ],
+  selectedBotId: null,     // For chart overlays
 
   setConnectionStatus: (status) => set({ connectionStatus: status }),
   
   setActiveSymbol: (symbol) => {
     setLocal('terminal_active_symbol', symbol);
     set({ activeSymbol: symbol });
+    // Dynamic import to request symbol history on change, avoiding circular dependencies
+    import('../services/websocket').then(({ sendWebSocketAction }) => {
+      sendWebSocketAction("subscribe_symbol", { symbol });
+    });
   },
 
   setViewMode: (mode) => {
@@ -63,7 +78,9 @@ export const useStore = create((set, get) => ({
     set({ viewMode: mode });
   },
 
-  updateHistory: (historyData) => set({ candleData: historyData }),
+  updateHistory: (historyData) => set((state) => ({ 
+    candleData: { ...state.candleData, ...historyData } 
+  })),
 
   updateAccount: (accountData) => set({
     balances: accountData.balances || {},
@@ -158,7 +175,18 @@ export const useStore = create((set, get) => ({
     if (newLogs.length > 100) newLogs.pop(); // Cap log size
     return { botLogs: newLogs };
   }),
+  setBotLogs: (logsArray) => set({
+    botLogs: logsArray.map(log => {
+      // The backend returns { bot_id, level, message, timestamp }
+      const time = new Date(log.timestamp + "Z").toLocaleTimeString(); // SQLite timestamp is UTC
+      return `[${time}] ${log.level || 'INFO'} - ${log.message}`;
+    })
+  }),
   clearBotLogs: () => set({ botLogs: [] }),
+
+  setBacktestResults: (results) => set({ backtestResults: results }),
+  setChartInteractionMode: (mode) => set({ chartInteractionMode: mode }),
+  setSelectedBotId: (id) => set({ selectedBotId: id }),
 
   setOrderResult: (result) => {
     set({ orderResult: result });
@@ -222,9 +250,9 @@ export const useStore = create((set, get) => ({
             // Update current active candle
             candles[candles.length - 1] = incomingCandle;
           } else {
-            // Append new candle
+            // Append new candle — keep 7 days of 1-min history (10080 candles)
             candles.push(incomingCandle);
-            if (candles.length > 500) {
+            if (candles.length > 10080) {
               candles.shift();
             }
           }
@@ -248,4 +276,4 @@ export const useStore = create((set, get) => ({
       return updates;
     });
   }
-}));
+})));
