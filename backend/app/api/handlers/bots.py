@@ -4,6 +4,7 @@ from app.api.responses import (
     broadcast_bots_update,
     send_backtest_result,
     send_bot_detail,
+    send_bots_history,
     send_bots_update,
     send_order_result,
 )
@@ -34,9 +35,12 @@ async def bot_create(ctx: RequestContext) -> None:
     timeframe = msg.get("timeframe", "1m")
     allocation = float(msg.get("allocation", 1000))
     config = msg.get("config", {})
+    execution_mode = msg.get("execution_mode", "BAR_CLOSE")
 
     try:
-        bot_id = await ctx.bot_manager.create_bot(strategy, symbol, timeframe, allocation, config)
+        bot_id = await ctx.bot_manager.create_bot(
+            strategy, symbol, timeframe, allocation, config, execution_mode=execution_mode
+        )
         await send_order_result(ctx, {
             "status": "success",
             "message": f"Bot {bot_id} created successfully",
@@ -101,6 +105,16 @@ async def bot_get_all(ctx: RequestContext) -> None:
     await send_bots_update(ctx)
 
 
+@route(Action.BOT_LIST_ALL, tags=["bots"])
+async def bot_list_all(ctx: RequestContext) -> None:
+    try:
+        limit = int(ctx.message.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    await send_bots_history(ctx, ctx.bot_manager.list_all_bots_public(limit=limit))
+
+
 @route(Action.RUN_BACKTEST, tags=["bots"])
 async def run_backtest(ctx: RequestContext) -> None:
     msg = ctx.message
@@ -127,6 +141,10 @@ async def run_backtest(ctx: RequestContext) -> None:
         results = ctx.backtester.run_backtest(symbol, strategy, config, candles)
         if isinstance(results, dict) and "error" not in results:
             results["meta"] = meta
+            from app.services.bots.backtest_store import save_backtest_run
+
+            run_id = save_backtest_run(symbol, strategy, config, days, results)
+            results["run_id"] = run_id
         await send_backtest_result(ctx, {"status": "success", "results": results})
     else:
         await send_backtest_result(ctx, {"status": "error", "message": "Backtester not available in current mode"})

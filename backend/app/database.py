@@ -21,12 +21,42 @@ def _safe_alter(cursor, sql: str):
         pass
 
 
+def _ensure_sim_market_state_table(cursor) -> None:
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sim_market_state (
+            symbol TEXT PRIMARY KEY,
+            price REAL NOT NULL,
+            candles_json TEXT NOT NULL,
+            target_json TEXT,
+            updated_at REAL NOT NULL
+        )
+    """)
+
+
+def _ensure_performance_indexes(cursor) -> None:
+    """Idempotent indexes for hot read/write paths (safe on existing DBs)."""
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_bot_trades_bot_time ON bot_trades (bot_id, timestamp)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_trades_bot_exit ON bot_trades (bot_id, is_exit)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_trades_order_id ON bot_trades (order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_snapshots_bot_time ON bot_snapshots (bot_id, timestamp DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status)",
+        "CREATE INDEX IF NOT EXISTS idx_orders_symbol_status ON orders (symbol, status)",
+        "CREATE INDEX IF NOT EXISTS idx_bot_positions_symbol ON bot_positions (symbol)",
+    ]
+    for sql in indexes:
+        _safe_alter(cursor, sql)
+
+
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
 
     if not is_postgres():
         cursor.execute("PRAGMA foreign_keys = ON;")
+        cursor.execute("PRAGMA journal_mode = WAL;")
+        cursor.execute("PRAGMA busy_timeout = 5000;")
+        cursor.execute("PRAGMA synchronous = NORMAL;")
     
     # Create accounts table
     cursor.execute("""
@@ -75,6 +105,7 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    _safe_alter(cursor, "ALTER TABLE bots ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'BAR_CLOSE'")
     
     # Create bot_logs table
     serial = _serial_type()
@@ -99,7 +130,8 @@ def init_db():
     _safe_alter(cursor, "ALTER TABLE positions ADD COLUMN take_profit_price REAL DEFAULT NULL")
     _safe_alter(cursor, "ALTER TABLE orders ADD COLUMN bot_id TEXT DEFAULT NULL")
     _safe_alter(cursor, "ALTER TABLE orders ADD COLUMN signal_id TEXT DEFAULT NULL")
-    _safe_alter(cursor, "ALTER TABLE bot_trades ADD COLUMN signal_bar_time INTEGER DEFAULT NULL")
+    _safe_alter(cursor, "ALTER TABLE orders ADD COLUMN realized_pnl REAL DEFAULT NULL")
+    _safe_alter(cursor, "ALTER TABLE orders ADD COLUMN cost_basis REAL DEFAULT NULL")
 
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS bot_trades (
@@ -112,11 +144,13 @@ def init_db():
             price REAL NOT NULL,
             pnl REAL,
             signal_id TEXT,
+            signal_bar_time INTEGER DEFAULT NULL,
             is_exit INTEGER NOT NULL DEFAULT 0,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
         )
     """)
+    _safe_alter(cursor, "ALTER TABLE bot_trades ADD COLUMN signal_bar_time INTEGER DEFAULT NULL")
     cursor.execute(f"""
         CREATE TABLE IF NOT EXISTS bot_snapshots (
             id {serial},
@@ -165,6 +199,21 @@ def init_db():
     )
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_signal_ledger (
+            signal_id TEXT PRIMARY KEY,
+            bot_id TEXT NOT NULL,
+            bar_time INTEGER,
+            signal_kind TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'claimed',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (bot_id) REFERENCES bots(id) ON DELETE CASCADE
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_bot_signal_ledger_bot ON bot_signal_ledger (bot_id)"
+    )
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS ambiguous_orders (
             id TEXT PRIMARY KEY,
             symbol TEXT NOT NULL,
@@ -185,8 +234,25 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_ambiguous_orders_status ON ambiguous_orders (status)"
     )
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backtest_runs (
+            id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            config TEXT,
+            days INTEGER NOT NULL DEFAULT 7,
+            results TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_symbol ON backtest_runs (symbol, created_at DESC)"
+    )
+
     from app.services.archive.schema import init_archive_schema
     init_archive_schema(cursor)
+    _ensure_performance_indexes(cursor)
+    _ensure_sim_market_state_table(cursor)
 
     conn.commit()
     
@@ -228,6 +294,7 @@ def reset_db():
     cursor.execute("DELETE FROM bot_trades;")
     cursor.execute("DELETE FROM bot_snapshots;")
     cursor.execute("DELETE FROM bot_logs;")
+    cursor.execute("DELETE FROM bot_signal_ledger;")
     cursor.execute("UPDATE bots SET status = 'STOPPED'")
     
     # Collect all unique base assets dynamically from config

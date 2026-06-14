@@ -56,7 +56,19 @@ BOT_MIN_NOTIONAL = float(os.environ.get("BOT_MIN_NOTIONAL", "10.0"))
 BOT_DAILY_LOSS_LIMIT_PCT = float(os.environ.get("BOT_DAILY_LOSS_LIMIT_PCT", "5.0"))
 BOT_MAX_ACTIVE_BOTS = int(os.environ.get("BOT_MAX_ACTIVE_BOTS", "20"))
 BOT_SNAPSHOT_INTERVAL = float(os.environ.get("BOT_SNAPSHOT_INTERVAL", "300"))
-BOT_LOG_RETENTION = int(os.environ.get("BOT_LOG_RETENTION", "500"))
+BOT_SNAPSHOT_RETENTION = int(os.environ.get("BOT_SNAPSHOT_RETENTION", "2000"))
+
+# Portfolio-level risk (all bots combined)
+PORTFOLIO_MAX_GROSS_EXPOSURE_PCT = float(os.environ.get("PORTFOLIO_MAX_GROSS_EXPOSURE_PCT", "80"))
+PORTFOLIO_MAX_GROUP_EXPOSURE_PCT = float(os.environ.get("PORTFOLIO_MAX_GROUP_EXPOSURE_PCT", "40"))
+
+# Static correlation buckets for group exposure caps
+CORRELATION_GROUPS = {
+    "TECH": ["AAPL", "MSFT", "NVDA", "AMD", "GOOGL", "AMZN", "META", "NFLX"],
+    "INDEX_ETF": ["SPY", "QQQ"],
+    "CRYPTO_MAJOR": ["BTCUSDT", "ETHUSDT"],
+    "CRYPTO_ALT": ["SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "DOTUSDT", "LTCUSDT", "LINKUSDT"],
+}
 
 # Long-term market bar archive (1m bars → DB, rollup to 1h after retention window)
 ARCHIVE_ENABLED = os.environ.get("ARCHIVE_ENABLED", "true").lower() in ("1", "true", "yes")
