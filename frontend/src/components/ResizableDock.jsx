@@ -4,11 +4,11 @@
  *   Positions | Orders | Balances | Algo Bot | Analyst | Bot History | Ticks | History | Equity Curve
  *
  * Features:
- *  - Drag-to-resize via top handle (persists to localStorage)
+ *  - Drag-to-resize via top handle (persists to workspace settings)
  *  - History tab can be expanded to full-screen overlay
  *  - Badge counts on Positions and Orders tabs
  */
-import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, lazy } from 'react';
 import { toast } from 'sonner';
 import { useStore } from '../store/useStore';
 import { useSettingsStore } from '../store/useSettingsStore';
@@ -23,15 +23,20 @@ import EquityCurveTab from './EquityCurveTab';
 import TradeHistoryContent from './TradeHistoryPanel';
 import BacktestResultsPanel from './BacktestResultsPanel';
 import BotDetailDrawer from './BotDetailDrawer';
-import TickViewerTab from './TickViewerTab';
-import BotHistoryTab from './BotHistoryTab';
-import AnalystTab from './AnalystTab';
-import ScannerTab from './ScannerTab';
 import ReconciliationTab from './ReconciliationTab';
 import ErrorBoundary from './ErrorBoundary';
 import StrategyTemplateCard from './StrategyTemplateCard';
 import StrategyBadge from './StrategyBadge';
 import { WidgetEmpty, ScrollTablePanel } from './WidgetShell';
+
+const TickViewerTab = lazy(() => import('./TickViewerTab'));
+const BotHistoryTab = lazy(() => import('./BotHistoryTab'));
+const AnalystTab = lazy(() => import('./AnalystTab'));
+const ScannerTab = lazy(() => import('./ScannerTab'));
+
+function DockTabFallback() {
+  return <WidgetEmpty message="Loading tab…" />;
+}
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -50,11 +55,11 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { cn } from '@/lib/utils';
 import { formatLastSignal } from '@/lib/formatTime';
 import { buildBotLookup, getPositionBots, shortBotId } from '@/lib/botAttribution';
+import { DOCK_GROUP_CONFIG, dockGroupForTab } from '../settings/layoutModes';
 
 const DOCK_MIN = 200;
 const DOCK_MAX = 560;
 const DOCK_DEFAULT = 320;
-const STORAGE_KEY = 'terminal_dock_height';
 
 const DOCK_TAB_IDS = new Set([
   'positions', 'orders', 'balances', 'algo', 'scanner', 'analyst',
@@ -553,7 +558,7 @@ function BalancesTab() {
 }
 
 // ── Algo Bot Tab ──────────────────────────────────────────────────
-function AlgoTab() {
+export function AlgoTab() {
   const {
     activeBots, botStrategy, botExecutionMode, botConfig, activeSymbol, symbolsList,
     setBotStrategy, setBotExecutionMode, updateBotConfig, clearBotLogs, botLogs,
@@ -1268,8 +1273,13 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
   const workspaceTab = normalizeDockTab(
     useSettingsStore(state => state.settings.workspace?.dockActiveTab || 'positions'),
   );
+  const workspaceGroup = useSettingsStore(state => state.settings.workspace?.dockGroup || 'portfolio');
+  const dockCollapsed = useSettingsStore(state => state.settings.workspace?.dockCollapsed ?? false);
   const updateWorkspace = useSettingsStore(state => state.updateWorkspace);
   const [activeTab, setActiveTab] = useState(workspaceTab);
+  const [activeGroup, setActiveGroup] = useState(
+    DOCK_GROUP_CONFIG[workspaceGroup] ? workspaceGroup : dockGroupForTab(workspaceTab),
+  );
   const [dockH, setDockH] = useState(() => initialDockHeight || DOCK_DEFAULT);
   const [historyFullscreen, setHistoryFullscreen] = useState(false);
   const isDragging = useRef(false);
@@ -1283,7 +1293,14 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
 
   useEffect(() => {
     setActiveTab(workspaceTab);
+    setActiveGroup(dockGroupForTab(workspaceTab));
   }, [workspaceTab]);
+
+  useEffect(() => {
+    if (DOCK_GROUP_CONFIG[workspaceGroup]) {
+      setActiveGroup(workspaceGroup);
+    }
+  }, [workspaceGroup]);
 
   // Sync dock height to parent App so CSS variable can update
   useEffect(() => {
@@ -1295,19 +1312,44 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
       if (e.detail) {
         const tab = normalizeDockTab(e.detail);
         setActiveTab(tab);
-        updateWorkspace({ dockActiveTab: tab });
+        setActiveGroup(dockGroupForTab(tab));
+        updateWorkspace({ dockActiveTab: tab, dockGroup: dockGroupForTab(tab) });
+      }
+    };
+    const onDockGroup = (e) => {
+      if (e.detail && DOCK_GROUP_CONFIG[e.detail]) {
+        setActiveGroup(e.detail);
+        const firstTab = DOCK_GROUP_CONFIG[e.detail].tabs[0];
+        setActiveTab(firstTab);
+        updateWorkspace({ dockGroup: e.detail, dockActiveTab: firstTab });
       }
     };
     window.addEventListener('dock-tab', onDockTab);
-    return () => window.removeEventListener('dock-tab', onDockTab);
+    window.addEventListener('dock-group', onDockGroup);
+    return () => {
+      window.removeEventListener('dock-tab', onDockTab);
+      window.removeEventListener('dock-group', onDockGroup);
+    };
   }, [updateWorkspace]);
 
   const handleTabChange = useCallback((tab) => {
     if (!tab) return;
     const next = normalizeDockTab(tab);
+    const group = dockGroupForTab(next);
     setActiveTab(next);
-    updateWorkspace({ dockActiveTab: next });
+    setActiveGroup(group);
+    updateWorkspace({ dockActiveTab: next, dockGroup: group });
   }, [updateWorkspace]);
+
+  const handleGroupChange = useCallback((group) => {
+    if (!group || !DOCK_GROUP_CONFIG[group]) return;
+    const firstTab = DOCK_GROUP_CONFIG[group].tabs.includes(activeTab)
+      ? activeTab
+      : DOCK_GROUP_CONFIG[group].tabs[0];
+    setActiveGroup(group);
+    setActiveTab(firstTab);
+    updateWorkspace({ dockGroup: group, dockActiveTab: firstTab });
+  }, [activeTab, updateWorkspace]);
 
   const pendingOrders = orders.filter(o => o.status === 'PENDING').length;
   const posCount = Object.keys(positions).length;
@@ -1347,18 +1389,35 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
   });
 
   const TABS = [
-    { id: 'positions', label: 'Positions', icon: Briefcase, badge: posCount || null },
-    { id: 'orders',    label: 'Orders',    icon: List,     badge: pendingOrders || null },
-    { id: 'balances',  label: 'Balances',  icon: Landmark  },
-    { id: 'algo',      label: 'Algo Bot',  icon: Cpu       },
-    { id: 'scanner',   label: 'Scanner',   icon: Radar,    badge: scanBadge },
-    { id: 'analyst',   label: 'Analyst',   icon: Brain,    badge: analystBadge },
-    { id: 'reconcile', label: 'Reconcile', icon: AlertTriangle, badge: isLive && ambiguousOrders.length ? ambiguousOrders.length : null },
-    { id: 'bots',      label: 'Bot History', icon: History, badge: botHistory.length || null },
-    { id: 'ticks',     label: 'Ticks',     icon: Zap       },
-    { id: 'history',   label: 'History',   icon: Activity, badge: tradeHistory.length || null },
-    { id: 'equity',    label: 'Equity Curve', icon: TrendingUp },
+    { id: 'positions', label: 'Positions', icon: Briefcase, badge: posCount || null, group: 'portfolio' },
+    { id: 'orders',    label: 'Orders',    icon: List,     badge: pendingOrders || null, group: 'portfolio' },
+    { id: 'balances',  label: 'Balances',  icon: Landmark, group: 'portfolio' },
+    { id: 'algo',      label: 'Algo Bot',  icon: Cpu,      group: 'automation' },
+    { id: 'scanner',   label: 'Scanner',   icon: Radar,    badge: scanBadge, group: 'intelligence' },
+    { id: 'analyst',   label: 'Analyst',   icon: Brain,    badge: analystBadge, group: 'intelligence' },
+    { id: 'reconcile', label: 'Reconcile', icon: AlertTriangle, badge: isLive && ambiguousOrders.length ? ambiguousOrders.length : null, group: 'automation' },
+    { id: 'bots',      label: 'Bot History', icon: History, badge: botHistory.length || null, group: 'automation' },
+    { id: 'ticks',     label: 'Ticks',     icon: Zap,      group: 'data' },
+    { id: 'history',   label: 'History',   icon: Activity, badge: tradeHistory.length || null, group: 'data' },
+    { id: 'equity',    label: 'Equity Curve', icon: TrendingUp, group: 'data' },
   ];
+
+  const groupTabs = TABS.filter((t) => t.group === activeGroup);
+  const groupBadge = (groupId) => {
+    const tabs = TABS.filter((t) => t.group === groupId);
+    return tabs.reduce((sum, t) => sum + (Number(t.badge) || 0), 0) || null;
+  };
+
+  if (dockCollapsed) {
+    return (
+      <div className="bottom-dock bottom-dock--collapsed flex items-center justify-between px-3" style={{ gridArea: 'dock', height: 36 }}>
+        <span className="text-[0.62rem] text-muted-foreground">Dock collapsed</span>
+        <Button variant="ghost" size="xs" className="text-xs" onClick={() => updateWorkspace({ dockCollapsed: false })}>
+          Expand dock
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -1371,9 +1430,27 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
 
         <Tabs value={activeTab} onValueChange={handleTabChange} className="dock-tabs-root gap-0">
           <div className="dock-tab-bar">
+            <div className="dock-group-rail">
+              {Object.entries(DOCK_GROUP_CONFIG).map(([groupId, cfg]) => (
+                <Button
+                  key={groupId}
+                  variant={activeGroup === groupId ? 'secondary' : 'ghost'}
+                  size="xs"
+                  className="dock-group-btn h-7 px-2 text-[0.62rem]"
+                  onClick={() => handleGroupChange(groupId)}
+                >
+                  {cfg.label}
+                  {groupBadge(groupId) != null && (
+                    <Badge variant="secondary" className="ml-1 h-4 min-w-4 px-1 text-[0.55rem]">
+                      {groupBadge(groupId)}
+                    </Badge>
+                  )}
+                </Button>
+              ))}
+            </div>
             <div className="dock-tab-bar-inner scroll-fade-x">
               <TabsList variant="line" className="dock-tab-switch scroll-panel-x no-scrollbar min-w-0 flex-1 justify-start rounded-none border-0 bg-transparent">
-                {TABS.map(tab => {
+                {groupTabs.map(tab => {
                   const Icon = tab.icon;
                   return (
                     <TabsTrigger
@@ -1398,6 +1475,19 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
               </TabsList>
             </div>
             <div className="dock-tab-actions">
+            {activeGroup === 'intelligence' && (
+              <Button variant="outline" size="xs" className="h-6 text-[0.58rem]" onClick={() => window.dispatchEvent(new CustomEvent('insights-hub-open'))}>
+                Hub
+              </Button>
+            )}
+            {activeGroup === 'automation' && (
+              <Button variant="outline" size="xs" className="h-6 text-[0.58rem]" onClick={() => window.dispatchEvent(new CustomEvent('automation-studio-open'))}>
+                Studio
+              </Button>
+            )}
+            <Button variant="ghost" size="xs" className="h-6 text-[0.58rem] text-muted-foreground" onClick={() => updateWorkspace({ dockCollapsed: true })} title="Collapse dock">
+              <Minimize2 size={12} />
+            </Button>
             {activeTab === 'history' && (
               <Button
                 variant="ghost"
@@ -1434,13 +1524,21 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
           </TabsContent>
           <TabsContent value="scanner" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Scanner">
-              <ScannerTab />
+              {activeTab === 'scanner' && (
+                <Suspense fallback={<DockTabFallback />}>
+                  <ScannerTab />
+                </Suspense>
+              )}
             </ErrorBoundary>
           </TabsContent>
 
           <TabsContent value="analyst" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Chart Analyst">
-              <AnalystTab />
+              {activeTab === 'analyst' && (
+                <Suspense fallback={<DockTabFallback />}>
+                  <AnalystTab />
+                </Suspense>
+              )}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="reconcile" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
@@ -1450,12 +1548,20 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
           </TabsContent>
           <TabsContent value="bots" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Bot History">
-              <BotHistoryTab />
+              {activeTab === 'bots' && (
+                <Suspense fallback={<DockTabFallback />}>
+                  <BotHistoryTab />
+                </Suspense>
+              )}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="ticks" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Ticks">
-              <TickViewerTab />
+              {activeTab === 'ticks' && (
+                <Suspense fallback={<DockTabFallback />}>
+                  <TickViewerTab />
+                </Suspense>
+              )}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="equity" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">

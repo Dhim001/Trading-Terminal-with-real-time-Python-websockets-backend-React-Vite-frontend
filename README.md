@@ -129,6 +129,23 @@ Built on **React 19**, **Vite 8**, **Zustand**, **ECharts**, and **shadcn/ui** (
   - `⌘K` / `Ctrl+K` — open command palette
   - `⌘1` / `Ctrl+1` — single chart view
   - `⌘2` / `Ctrl+2` — multi-chart view
+  - `F` — Zen chart (hide dock & order panel)
+- **Layout modes (UX overhaul)** — header workspace switcher: **Trade**, **Analyze**, **Automate**, **Portfolio**; each remaps dock, right panel, and default tabs
+- **Grouped dock** — Portfolio · Intelligence · Automation · Data category rails with sub-tabs
+- **Command bar** — merged symbol context, watchlist strip, and portfolio metrics (replaces separate aux + strip rows)
+- **Trading panel tabs** — Trade | Book | Depth with collapse chevron
+- **Insights Hub** (`⌘I`) — Scanner + Analyst in one sheet
+- **Automation Studio** — bot ops sheet from dock Automation group
+- **Activity Center** — header bell icon for alerts, bot logs, connection status
+- **Chart context strip** — clickable breadcrumb under chart (symbol, TF, analyst signal, bots)
+- **Built-in workspace presets** — Day Trade, Research, Bot Ops (Settings + header switcher)
+- **Onboarding & help (Phase 1)** — first-visit welcome tour (`OnboardingTour`), header **Help** button (`HelpSheet` with workflows, glossary, shortcuts), and **Replay welcome tour** in Settings → Layout
+- **Market scanner (Phase 6)** — dock **Scanner** tab: multi-symbol scan, filters, optional 60s auto-refresh
+- **Chart Analyst (Phase 6)** — dock **Analyst** tab: insight history, compare mode, vision structure notes
+- **Alerts (Phase 4)** — price/signal toast rules in Settings → Layout; evaluated by `useAlertMonitor`
+- **Chart overlay toggles (Phase 4)** — Settings → Chart: trade markers, position SL/TP, analyst levels, bot markers (persisted in `chartLayout.overlays`)
+- **Performance (Phase 2)** — lazy-loaded dock tabs, windowed analyst history table, throttled live candle updates
+- **Vision LLM (optional)** — set `OPENAI_API_KEY` (and optionally `OPENAI_VISION_MODEL=gpt-4o-mini`) in backend `.env` to enable chart structure analysis from the Analyst tab **Vision** button; without a key, vision requests return a clear configuration error
 - Trading-specific button variants: `buy`, `sell`, `live` badges
 - **HTTP bootstrap (Phase 4a)** — on mount, parallel REST calls hydrate account, history, bots, and chart candles before WebSocket connects; live ticks still stream over WS. See `frontend/src/api/` and `hooks/useBootstrap.js`. Dev uses Vite proxy (`vite.config.js`); set `VITE_HTTP_BASE_URL` for production builds (`frontend/.env.example`).
 - **Unified transport (Phase 4c)** — `sendAction()` in `frontend/src/api/transport.js` tries WebSocket first, then falls back to the matching REST endpoint when WS is offline (orders, bots, admin, SL/TP, etc.).
