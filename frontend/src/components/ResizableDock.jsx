@@ -17,7 +17,7 @@ import { Action } from '../api/protocol';
 import {
   Briefcase, List, Landmark, Cpu, Activity, TrendingUp,
   Play, Settings, Trash2, XSquare, Maximize2, Minimize2, ShieldAlert, Pause, PlayCircle, OctagonX,
-  RefreshCw, AlertTriangle, Zap, History, Brain, Radar,
+  RefreshCw, AlertTriangle, Zap, History, Brain, Radar, ChevronUp,
 } from 'lucide-react';
 import EquityCurveTab from './EquityCurveTab';
 import TradeHistoryContent from './TradeHistoryPanel';
@@ -54,8 +54,12 @@ import {
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { cn } from '@/lib/utils';
 import { formatLastSignal } from '@/lib/formatTime';
+import { BAR_TIMEFRAMES, deployTimeframeSummary, formatBarTimeframeLabel } from '@/lib/barTimeframes';
+import { selectAgentInsight } from '@/lib/agentInsights';
 import { buildBotLookup, getPositionBots, shortBotId } from '@/lib/botAttribution';
 import { DOCK_GROUP_CONFIG, dockGroupForTab } from '../settings/layoutModes';
+import { selectPositionStats } from '../store/selectors';
+import { useShallow } from 'zustand/react/shallow';
 
 const DOCK_MIN = 200;
 const DOCK_MAX = 560;
@@ -211,24 +215,11 @@ const PositionRow = React.memo(function PositionRow({ sym, pos, ownerBots = [] }
 
 // ── Positions Tab ─────────────────────────────────────────────────
 function PositionsTab() {
-  const positions = useStore(state => state.positions);
-  const tickerData = useStore(state => state.tickerData);
-  const activeBots = useStore(state => state.activeBots);
-  const tradeHistory = useStore(state => state.tradeHistory);
+  const positions = useStore((state) => state.positions);
+  const stats = useStore(useShallow(selectPositionStats));
+  const activeBots = useStore((state) => state.activeBots);
+  const tradeHistory = useStore((state) => state.tradeHistory);
   const entries = Object.entries(positions);
-
-  const stats = useMemo(() => {
-    let totalPnl = 0;
-    let longCount = 0;
-    let shortCount = 0;
-    for (const [sym, pos] of entries) {
-      const mark = tickerData[sym]?.price ?? pos.avg_price;
-      totalPnl += pos.size * (mark - pos.avg_price);
-      if (pos.size >= 0) longCount += 1;
-      else shortCount += 1;
-    }
-    return { totalPnl, longCount, shortCount };
-  }, [entries, tickerData]);
 
   const botCtx = { activeBots, tradeHistory };
   const pnlPositive = stats.totalPnl >= 0;
@@ -448,19 +439,17 @@ function OrdersTab() {
 
 // ── Balances Tab ──────────────────────────────────────────────────
 function BalancesTab() {
-  const balances = useStore(state => state.balances);
-  const tickerData = useStore(state => state.tickerData);
-  const symbolsList = useStore(state => state.symbolsList);
-
-  const assetMark = useMemo(() => {
+  const balances = useStore((state) => state.balances);
+  const assetMark = useStore(useShallow((state) => {
     const map = {};
-    for (const sym of symbolsList || []) {
+    for (const sym of state.symbolsList || []) {
+      const price = state.tickerData[sym]?.price;
+      if (price == null) continue;
       const asset = assetFromSymbol(sym);
-      const price = tickerData[sym]?.price;
-      if (price != null) map[asset] = price;
+      map[asset] = Math.round(price * 100) / 100;
     }
     return map;
-  }, [symbolsList, tickerData]);
+  }));
 
   const { rows, stats } = useMemo(
     () => buildBalanceView(balances, assetMark),
@@ -558,18 +547,49 @@ function BalancesTab() {
 }
 
 // ── Algo Bot Tab ──────────────────────────────────────────────────
-export function AlgoTab() {
+export function AlgoTab({ hideToolbar = false }) {
   const {
-    activeBots, botStrategy, botExecutionMode, botConfig, activeSymbol, symbolsList,
-    setBotStrategy, setBotExecutionMode, updateBotConfig, clearBotLogs, botLogs,
+    activeBots, botStrategy, botExecutionMode, botTimeframe, botConfig, activeSymbol, symbolsList,
+    setBotStrategy, setBotExecutionMode, setBotTimeframe, updateBotConfig, clearBotLogs, botLogs,
     strategyTemplates, backtestResults, backtestRuns, setChartInteractionMode,
     isLive, allowLiveBots, terminalMode, terminalRole, distributed, botMinCandles,
     setActiveSymbol,
     selectedBotId, setSelectedBotId, setBotDetail, setBotDrawerOpen,
     ambiguousOrders, setAmbiguousOrders,
-  } = useStore();
-  const positions = useStore(state => state.positions);
-  const agentInsights = useStore(state => state.agentInsights);
+  } = useStore(useShallow((s) => ({
+    activeBots: s.activeBots,
+    botStrategy: s.botStrategy,
+    botExecutionMode: s.botExecutionMode,
+    botTimeframe: s.botTimeframe,
+    botConfig: s.botConfig,
+    activeSymbol: s.activeSymbol,
+    symbolsList: s.symbolsList,
+    setBotStrategy: s.setBotStrategy,
+    setBotExecutionMode: s.setBotExecutionMode,
+    setBotTimeframe: s.setBotTimeframe,
+    updateBotConfig: s.updateBotConfig,
+    clearBotLogs: s.clearBotLogs,
+    botLogs: s.botLogs,
+    strategyTemplates: s.strategyTemplates,
+    backtestResults: s.backtestResults,
+    backtestRuns: s.backtestRuns,
+    setChartInteractionMode: s.setChartInteractionMode,
+    isLive: s.isLive,
+    allowLiveBots: s.allowLiveBots,
+    terminalMode: s.terminalMode,
+    terminalRole: s.terminalRole,
+    distributed: s.distributed,
+    botMinCandles: s.botMinCandles,
+    setActiveSymbol: s.setActiveSymbol,
+    selectedBotId: s.selectedBotId,
+    setSelectedBotId: s.setSelectedBotId,
+    setBotDetail: s.setBotDetail,
+    setBotDrawerOpen: s.setBotDrawerOpen,
+    ambiguousOrders: s.ambiguousOrders,
+    setAmbiguousOrders: s.setAmbiguousOrders,
+  })));
+  const positions = useStore((state) => state.positions);
+  const agentInsights = useStore((state) => state.agentInsights);
 
   const liveBotsBlocked = isLive && !allowLiveBots;
   const runningCount = activeBots.filter(b => b.status === 'RUNNING').length;
@@ -604,10 +624,13 @@ export function AlgoTab() {
     sendAction(Action.BOT_CREATE, {
       strategy: botStrategy,
       symbol: activeSymbol,
-      timeframe: botExecutionMode === 'TICK' ? 'tick' : '1m',
+      timeframe: botExecutionMode === 'TICK' ? 'tick' : botTimeframe,
       allocation: botConfig.allocation,
       execution_mode: botExecutionMode,
-      config: botConfig,
+      config: {
+        ...botConfig,
+        trailing_stop_percent: botConfig.trailing_stop_percent ?? 2,
+      },
     });
   };
 
@@ -621,6 +644,7 @@ export function AlgoTab() {
       symbol: activeSymbol,
       config: botConfig,
       days: parseInt(backtestDays, 10) || 7,
+      timeframe: botTimeframe,
     });
   };
 
@@ -643,6 +667,13 @@ export function AlgoTab() {
   const handleResumeBot = (bot_id) => {
     sendAction(Action.BOT_RESUME, { bot_id });
   };
+
+  const handleSetBotStopLoss = useCallback((bot) => {
+    if (bot.symbol && bot.symbol !== activeSymbol) {
+      setActiveSymbol(bot.symbol);
+    }
+    setChartInteractionMode('edit_sl');
+  }, [activeSymbol, setActiveSymbol, setChartInteractionMode]);
 
   const handleStopAll = () => {
     if (activeBots.length === 0) return;
@@ -706,36 +737,38 @@ export function AlgoTab() {
   };
 
   return (
-    <div className="algo-tab">
-      <header className="algo-tab__toolbar">
-        <div className="algo-tab__toolbar-lead">
-          <div className="algo-tab__toolbar-icon" aria-hidden>
-            <Cpu size={14} />
+    <div className={cn('algo-tab', hideToolbar && 'algo-tab--embedded')}>
+      {!hideToolbar ? (
+        <header className="algo-tab__toolbar">
+          <div className="algo-tab__toolbar-lead">
+            <div className="algo-tab__toolbar-icon" aria-hidden>
+              <Cpu size={14} />
+            </div>
+            <div className="algo-tab__toolbar-copy">
+              <span className="algo-tab__toolbar-title">Algo Trading</span>
+              <span className="algo-tab__toolbar-subtitle num-mono">
+                {runningCount} running · {activeBots.length} bot{activeBots.length === 1 ? '' : 's'} · {activeSymbol}
+              </span>
+            </div>
           </div>
-          <div className="algo-tab__toolbar-copy">
-            <span className="algo-tab__toolbar-title">Algo Trading</span>
-            <span className="algo-tab__toolbar-subtitle num-mono">
-              {runningCount} running · {activeBots.length} bot{activeBots.length === 1 ? '' : 's'} · {activeSymbol}
-            </span>
+          <div className="algo-tab__toolbar-meta">
+            {isLive ? (
+              <Badge variant="live" className="header-mode-badge header-mode-badge--live px-2 py-0.5 text-[0.58rem] font-extrabold tracking-wider">
+                LIVE
+              </Badge>
+            ) : (
+              <Badge variant="secondary" className="header-mode-badge px-2 py-0.5 text-[0.58rem] font-bold">
+                SIM
+              </Badge>
+            )}
+            {liveBotsBlocked && (
+              <Badge variant="outline" className="algo-tab__toolbar-warn px-2 py-0.5 text-[0.58rem]">
+                Exec locked
+              </Badge>
+            )}
           </div>
-        </div>
-        <div className="algo-tab__toolbar-meta">
-          {isLive ? (
-            <Badge variant="live" className="header-mode-badge header-mode-badge--live px-2 py-0.5 text-[0.58rem] font-extrabold tracking-wider">
-              LIVE
-            </Badge>
-          ) : (
-            <Badge variant="secondary" className="header-mode-badge px-2 py-0.5 text-[0.58rem] font-bold">
-              SIM
-            </Badge>
-          )}
-          {liveBotsBlocked && (
-            <Badge variant="outline" className="algo-tab__toolbar-warn px-2 py-0.5 text-[0.58rem]">
-              Exec locked
-            </Badge>
-          )}
-        </div>
-      </header>
+        </header>
+      ) : null}
 
       <div className="algo-tab__workspace">
       {liveBotsBlocked && (
@@ -757,7 +790,7 @@ export function AlgoTab() {
             <strong>Live bots enabled</strong> on {terminalMode}
             {distributed ? ` · role=${terminalRole} (distributed via Redis)` : ''}.
             Indicator warm-up uses archive when buffer &lt; {botMinCandles} bars.
-            Signals fire on closed 1m bars — do not resend ambiguous orders.
+            Signals fire on closed {formatBarTimeframeLabel(botTimeframe)} bars — do not resend ambiguous orders.
           </AlertDescription>
         </Alert>
       )}
@@ -850,14 +883,33 @@ export function AlgoTab() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper">
-                  <SelectItem value="BAR_CLOSE" className="text-xs">Bar Close — 1m indicator signals</SelectItem>
+                  <SelectItem value="BAR_CLOSE" className="text-xs">Bar Close — indicator signals on bar close</SelectItem>
                   <SelectItem value="TICK" className="text-xs">Tick — sub-minute microstructure</SelectItem>
                 </SelectContent>
               </Select>
               <span className="algo-field-hint">
-                Tick bots evaluate every price update with cooldown; bar bots fire on closed 1m candles only.
+                Tick bots evaluate every price update with cooldown; bar bots fire when a {formatBarTimeframeLabel(botTimeframe)} candle closes.
               </span>
             </div>
+
+            {botExecutionMode === 'BAR_CLOSE' && (
+            <div className="algo-deploy-field">
+              <Label className="algo-field-label">Bar Timeframe</Label>
+              <Select value={botTimeframe} onValueChange={setBotTimeframe}>
+                <SelectTrigger className="h-8 w-full text-xs" aria-label="Bot bar timeframe">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper">
+                  {BAR_TIMEFRAMES.map((tf) => (
+                    <SelectItem key={tf} value={tf} className="text-xs">{tf} bars</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span className="algo-field-hint">
+                Strategy evaluates on closed {formatBarTimeframeLabel(botTimeframe)} candles — same resolution as backtest below.
+              </span>
+            </div>
+            )}
 
             <div className="algo-deploy-field">
               <Label className="algo-field-label">Strategy Templates</Label>
@@ -871,6 +923,29 @@ export function AlgoTab() {
                   />
                 ))}
               </div>
+            </div>
+
+            <div className="algo-deploy-field">
+              <Label className="algo-field-label">Trailing Stop Loss</Label>
+              <InputGroup className="h-8">
+                <InputGroupInput
+                  type="number"
+                  step="any"
+                  min="0"
+                  value={botConfig?.trailing_stop_percent ?? 2}
+                  onChange={e => updateBotConfig({
+                    trailing_stop_percent: parseFloat(e.target.value) || 0,
+                  })}
+                  className="text-xs"
+                  aria-label="Trailing stop loss percent"
+                />
+                <InputGroupAddon align="inline-end">
+                  <InputGroupText className="text-xs">%</InputGroupText>
+                </InputGroupAddon>
+              </InputGroup>
+              <span className="algo-field-hint">
+                Exits when price retraces this % from the best price since entry. Applied on every new position.
+              </span>
             </div>
 
             <div className="algo-deploy-field">
@@ -941,7 +1016,7 @@ export function AlgoTab() {
                 </InputGroupAddon>
               </InputGroup>
               <span className="algo-field-hint">
-                Risk sized at 1% of account balance using ATR-based stops. Signals evaluate on closed 1m bars.
+                Risk sized at 1% of account balance using ATR-based stops. Signals evaluate on closed {formatBarTimeframeLabel(botTimeframe)} bars.
               </span>
             </div>
 
@@ -977,6 +1052,23 @@ export function AlgoTab() {
             )}
 
             <div className="algo-deploy-field">
+              <Label className="algo-field-label">Backtest Timeframe</Label>
+              <Select value={botTimeframe} onValueChange={setBotTimeframe} disabled={botExecutionMode === 'TICK'}>
+                <SelectTrigger className="h-8 w-full text-xs" aria-label="Backtest bar timeframe">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper">
+                  {BAR_TIMEFRAMES.map((tf) => (
+                    <SelectItem key={tf} value={tf} className="text-xs">{tf} bars</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <span className="algo-field-hint">
+                Shared with deploy timeframe — resampled from archived 1m data.
+              </span>
+            </div>
+
+            <div className="algo-deploy-field">
               <Label className="algo-field-label">Backtest Range</Label>
               <Select value={backtestDays} onValueChange={setBacktestDays}>
                 <SelectTrigger className="h-8 w-full text-xs" aria-label="Backtest history range">
@@ -989,7 +1081,9 @@ export function AlgoTab() {
                 </SelectContent>
               </Select>
               <span className="algo-field-hint">
-                Uses archived 1m bars when range exceeds live buffer. Scroll the chart left to load older history.
+                {botTimeframe === '1m'
+                  ? 'Uses archived 1m bars when range exceeds live buffer.'
+                  : 'Ranges above 90d are capped to 1m archive retention for accurate resampling.'}
               </span>
             </div>
 
@@ -997,6 +1091,7 @@ export function AlgoTab() {
               <BacktestResultsPanel
                 results={backtestResults}
                 backtestDays={backtestDays}
+                backtestTimeframe={botTimeframe}
                 symbol={activeSymbol}
                 strategy={botStrategy}
                 recentRuns={backtestRuns}
@@ -1057,7 +1152,7 @@ export function AlgoTab() {
                     : `${botConfig?.take_profit_percent ?? '—'}% TP`}
               </strong>
             </div>
-            <div><span className="text-muted-foreground">Timeframe:</span> <strong>{botExecutionMode === 'TICK' ? 'tick (sub-minute)' : '1m (closed-bar signals)'}</strong></div>
+            <div><span className="text-muted-foreground">Timeframe:</span> <strong>{deployTimeframeSummary(botExecutionMode, botTimeframe)}</strong></div>
           </div>
           <DialogFooter showCloseButton={false}>
             <Button variant="outline" size="sm" onClick={() => setDeployOpen(false)}>Cancel</Button>
@@ -1115,6 +1210,7 @@ export function AlgoTab() {
               <tr>
                 <th>Symbol</th>
                 <th>Strategy</th>
+                <th className="text-center">TF</th>
                 <th className="text-center">Position</th>
                 <th className="text-right">Alloc</th>
                 <th className="text-right">Today PnL</th>
@@ -1126,7 +1222,7 @@ export function AlgoTab() {
             <tbody>
               {activeBots.length === 0 ? (
                 <tr>
-                  <td colSpan="8" className="algo-table-empty">
+                  <td colSpan="9" className="algo-table-empty">
                     No active bots. Pick a template and deploy.
                   </td>
                 </tr>
@@ -1144,8 +1240,11 @@ export function AlgoTab() {
                     <td className="text-xs">
                       <StrategyBadge strategy={bot.strategy} compact />
                       {bot.execution_mode === 'TICK' && (
-                        <Badge variant="outline" className="ml-1 h-4 px-1 text-[0.55rem]">TICK</Badge>
+                        <Badge variant="outline" className="ml-1 h-4 px-1 text-[0.65rem]">TICK</Badge>
                       )}
+                    </td>
+                    <td className="text-center text-xs num-mono text-muted-foreground">
+                      {bot.execution_mode === 'TICK' ? 'tick' : formatBarTimeframeLabel(bot.timeframe)}
                     </td>
                     <td className="text-center">
                       {inPosition ? (
@@ -1153,7 +1252,7 @@ export function AlgoTab() {
                           {pos.size > 0 ? 'LONG' : 'SHORT'}
                         </Badge>
                       ) : (
-                        <span className="text-muted-foreground text-[0.62rem]">FLAT</span>
+                        <span className="text-secondary-foreground text-xs">FLAT</span>
                       )}
                     </td>
                     <td className="num-mono text-right">${bot.allocation.toLocaleString()}</td>
@@ -1165,11 +1264,18 @@ export function AlgoTab() {
                     </td>
                     <td className="algo-last-signal" title={bot.last_signal_at || undefined}>
                       <span>{formatLastSignal(bot.last_signal_at)}</span>
-                      {bot.strategy === 'CHART_AGENT' && agentInsights[bot.symbol]?.confidence != null && (
-                        <span className="ml-1 text-[0.58rem] text-muted-foreground">
-                          ({Math.round(agentInsights[bot.symbol].confidence * 100)}% conf)
-                        </span>
-                      )}
+                      {bot.strategy === 'CHART_AGENT' && (() => {
+                        const insight = selectAgentInsight(
+                          agentInsights,
+                          bot.symbol,
+                          bot.execution_mode === 'TICK' ? '1m' : bot.timeframe,
+                        );
+                        return insight?.confidence != null ? (
+                          <span className="ml-1 text-xs text-muted-foreground">
+                            ({Math.round(insight.confidence * 100)}% conf)
+                          </span>
+                        ) : null;
+                      })()}
                     </td>
                     <td className="text-center">
                       <Badge variant={statusBadgeVariant(bot.status)}>{bot.status}</Badge>
@@ -1177,23 +1283,23 @@ export function AlgoTab() {
                     <td className="text-center" onClick={e => e.stopPropagation()}>
                       <div className="algo-bot-actions">
                         {bot.status === 'RUNNING' && (
-                          <>
-                            <Button variant="outline" size="xs" onClick={() => handlePauseBot(bot.id)} title="Pause bot">
-                              <Pause />
-                            </Button>
-                            <Button
-                              variant="outline"
-                              size="xs"
-                              onClick={() => setChartInteractionMode('edit_sl')}
-                              title="Set stop loss on chart"
-                            >
-                              SL
-                            </Button>
-                          </>
+                          <Button variant="outline" size="xs" onClick={() => handlePauseBot(bot.id)} title="Pause bot">
+                            <Pause />
+                          </Button>
                         )}
                         {bot.status === 'PAUSED' && (
                           <Button variant="outline" size="xs" onClick={() => handleResumeBot(bot.id)} title="Resume bot">
                             <PlayCircle />
+                          </Button>
+                        )}
+                        {bot.status !== 'STOPPED' && (
+                          <Button
+                            variant="outline"
+                            size="xs"
+                            onClick={() => handleSetBotStopLoss(bot)}
+                            title="Set stop loss on chart"
+                          >
+                            SL
                           </Button>
                         )}
                         {bot.status !== 'STOPPED' && (
@@ -1232,7 +1338,10 @@ export function AlgoTab() {
               <WidgetEmpty icon={Cpu} message="Bot console is empty" className="min-h-[80px]" />
             ) : botLogs.map((log, i) => {
               const isSignal = /Entry (BUY|SELL)|signal @/i.test(log);
-              const showInsight = isSignal && botStrategy === 'CHART_AGENT' && agentInsights[activeSymbol];
+              const chartAgentInsight = botStrategy === 'CHART_AGENT'
+                ? selectAgentInsight(agentInsights, activeSymbol, botTimeframe)
+                : null;
+              const showInsight = isSignal && chartAgentInsight;
               return (
                 <div key={`${i}-${log.slice(0, 24)}`} className={cn(logLineClass(log), showInsight && 'group relative')}>
                   <span>{log}</span>
@@ -1258,22 +1367,22 @@ export function AlgoTab() {
 
 // ── Main ResizableDock ────────────────────────────────────────────
 export default function ResizableDock({ setDockHeight: setParentDockHeight, initialDockHeight }) {
-  const positions = useStore(state => state.positions);
-  const orders = useStore(state => state.orders);
-  const tradeHistory = useStore(state => state.tradeHistory);
-  const isBotRunning = useStore(state => state.isBotRunning);
-  const botHistory = useStore(state => state.botHistory);
-  const agentInsightHistory = useStore(state => state.agentInsightHistory);
-  const activeSymbol = useStore(state => state.activeSymbol);
-  const ambiguousOrders = useStore(state => state.ambiguousOrders);
-  const isLive = useStore(state => state.isLive);
-  const selectedBotId = useStore(state => state.selectedBotId);
-  const botDrawerOpen = useStore(state => state.botDrawerOpen);
-  const setBotDrawerOpen = useStore(state => state.setBotDrawerOpen);
+  const posCount = useStore((s) => Object.keys(s.positions).length);
+  const pendingOrders = useStore((s) => s.orders.filter((o) => o.status === 'PENDING').length);
+  const tradeHistoryCount = useStore((s) => s.tradeHistory.length);
+  const botHistoryCount = useStore((s) => s.botHistory.length);
+  const ambiguousCount = useStore((s) => (s.isLive ? s.ambiguousOrders.length : 0));
+  const isBotRunning = useStore((s) => s.isBotRunning);
+  const isLive = useStore((s) => s.isLive);
+  const selectedBotId = useStore((s) => s.selectedBotId);
+  const botDrawerOpen = useStore((s) => s.botDrawerOpen);
+  const setBotDrawerOpen = useStore((s) => s.setBotDrawerOpen);
+  const analystBadge = useStore((s) => (s.agentInsightHistory[s.activeSymbol] ?? []).length || null);
   const workspaceTab = normalizeDockTab(
     useSettingsStore(state => state.settings.workspace?.dockActiveTab || 'positions'),
   );
   const workspaceGroup = useSettingsStore(state => state.settings.workspace?.dockGroup || 'portfolio');
+  const layoutMode = useSettingsStore(state => state.settings.workspace?.layoutMode || 'trade');
   const dockCollapsed = useSettingsStore(state => state.settings.workspace?.dockCollapsed ?? false);
   const updateWorkspace = useSettingsStore(state => state.updateWorkspace);
   const [activeTab, setActiveTab] = useState(workspaceTab);
@@ -1313,7 +1422,7 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
         const tab = normalizeDockTab(e.detail);
         setActiveTab(tab);
         setActiveGroup(dockGroupForTab(tab));
-        updateWorkspace({ dockActiveTab: tab, dockGroup: dockGroupForTab(tab) });
+        updateWorkspace({ dockActiveTab: tab, dockGroup: dockGroupForTab(tab), dockCollapsed: false });
       }
     };
     const onDockGroup = (e) => {
@@ -1321,7 +1430,7 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
         setActiveGroup(e.detail);
         const firstTab = DOCK_GROUP_CONFIG[e.detail].tabs[0];
         setActiveTab(firstTab);
-        updateWorkspace({ dockGroup: e.detail, dockActiveTab: firstTab });
+        updateWorkspace({ dockGroup: e.detail, dockActiveTab: firstTab, dockCollapsed: false });
       }
     };
     window.addEventListener('dock-tab', onDockTab);
@@ -1332,13 +1441,17 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
     };
   }, [updateWorkspace]);
 
+  const expandDock = useCallback(() => {
+    updateWorkspace({ dockCollapsed: false });
+  }, [updateWorkspace]);
+
   const handleTabChange = useCallback((tab) => {
     if (!tab) return;
     const next = normalizeDockTab(tab);
     const group = dockGroupForTab(next);
     setActiveTab(next);
     setActiveGroup(group);
-    updateWorkspace({ dockActiveTab: next, dockGroup: group });
+    updateWorkspace({ dockActiveTab: next, dockGroup: group, dockCollapsed: false });
   }, [updateWorkspace]);
 
   const handleGroupChange = useCallback((group) => {
@@ -1348,11 +1461,8 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
       : DOCK_GROUP_CONFIG[group].tabs[0];
     setActiveGroup(group);
     setActiveTab(firstTab);
-    updateWorkspace({ dockGroup: group, dockActiveTab: firstTab });
+    updateWorkspace({ dockGroup: group, dockActiveTab: firstTab, dockCollapsed: false });
   }, [activeTab, updateWorkspace]);
-
-  const pendingOrders = orders.filter(o => o.status === 'PENDING').length;
-  const posCount = Object.keys(positions).length;
 
   const onMouseDown = useCallback(e => {
     isDragging.current = true;
@@ -1382,7 +1492,6 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [updateWorkspace]);
 
-  const analystBadge = (agentInsightHistory[activeSymbol] ?? []).length || null;
   const scanBadge = useStore((s) => {
     const rows = s.scanResults?.rows ?? [];
     return rows.filter((r) => r.signal && r.signal !== 'NONE').length || null;
@@ -1395,10 +1504,10 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
     { id: 'algo',      label: 'Algo Bot',  icon: Cpu,      group: 'automation' },
     { id: 'scanner',   label: 'Scanner',   icon: Radar,    badge: scanBadge, group: 'intelligence' },
     { id: 'analyst',   label: 'Analyst',   icon: Brain,    badge: analystBadge, group: 'intelligence' },
-    { id: 'reconcile', label: 'Reconcile', icon: AlertTriangle, badge: isLive && ambiguousOrders.length ? ambiguousOrders.length : null, group: 'automation' },
-    { id: 'bots',      label: 'Bot History', icon: History, badge: botHistory.length || null, group: 'automation' },
+    { id: 'reconcile', label: 'Reconcile', icon: AlertTriangle, badge: ambiguousCount || null, group: 'automation' },
+    { id: 'bots',      label: 'Bot History', icon: History, badge: botHistoryCount || null, group: 'automation' },
     { id: 'ticks',     label: 'Ticks',     icon: Zap,      group: 'data' },
-    { id: 'history',   label: 'History',   icon: Activity, badge: tradeHistory.length || null, group: 'data' },
+    { id: 'history',   label: 'History',   icon: Activity, badge: tradeHistoryCount || null, group: 'data' },
     { id: 'equity',    label: 'Equity Curve', icon: TrendingUp, group: 'data' },
   ];
 
@@ -1409,12 +1518,58 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
   };
 
   if (dockCollapsed) {
+    const collapsedTab = TABS.find((t) => t.id === activeTab) ?? TABS.find((t) => t.id === workspaceTab);
+    const CollapsedIcon = collapsedTab?.icon ?? Briefcase;
+    const groupLabel = DOCK_GROUP_CONFIG[activeGroup]?.label ?? 'Portfolio';
+    const groupTotal = groupBadge(activeGroup);
+
     return (
-      <div className="bottom-dock bottom-dock--collapsed flex items-center justify-between px-3" style={{ gridArea: 'dock', height: 36 }}>
-        <span className="text-[0.62rem] text-muted-foreground">Dock collapsed</span>
-        <Button variant="ghost" size="xs" className="text-xs" onClick={() => updateWorkspace({ dockCollapsed: false })}>
-          Expand dock
-        </Button>
+      <div
+        className="bottom-dock bottom-dock--collapsed dock-collapsed-rail"
+        data-layout-mode={layoutMode}
+        data-dock-group={activeGroup}
+        style={{ gridArea: 'dock' }}
+        role="button"
+        tabIndex={0}
+        aria-label={`Expand dock — ${groupLabel}, ${collapsedTab?.label ?? 'tab'}`}
+        title="Expand dock"
+        onClick={expandDock}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            expandDock();
+          }
+        }}
+      >
+        <div className="dock-collapsed-rail__grip" aria-hidden>
+          <span className="dock-collapsed-rail__grip-bar" />
+        </div>
+
+        <div className="dock-collapsed-rail__inner">
+          <div className="dock-collapsed-rail__heading">
+            <span className="dock-collapsed-rail__eyebrow">{groupLabel}</span>
+            <div className="dock-collapsed-rail__title-row">
+              <ChevronUp className="dock-collapsed-rail__chevron" aria-hidden />
+              <span className="dock-collapsed-rail__icon-wrap" aria-hidden>
+                <CollapsedIcon className="dock-collapsed-rail__title-icon" />
+              </span>
+              <span className="dock-collapsed-rail__title">{collapsedTab?.label ?? 'Dock'}</span>
+              {collapsedTab?.badge != null && (
+                <Badge variant="secondary" className="dock-collapsed-rail__badge">
+                  {collapsedTab.badge}
+                </Badge>
+              )}
+              {groupTotal != null && collapsedTab?.badge == null && (
+                <Badge variant="secondary" className="dock-collapsed-rail__badge">
+                  {groupTotal}
+                </Badge>
+              )}
+              {collapsedTab?.id === 'algo' && isBotRunning && (
+                <span className="dock-collapsed-rail__pulse" aria-hidden />
+              )}
+            </div>
+          </div>
+        </div>
       </div>
     );
   }
@@ -1423,6 +1578,8 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
     <>
       <div
         className="bottom-dock flex flex-col"
+        data-layout-mode={layoutMode}
+        data-dock-group={activeGroup}
         data-compact={dockH < 280 ? '' : undefined}
         style={{ gridArea: 'dock', height: dockH, minHeight: DOCK_MIN }}
       >
@@ -1436,7 +1593,9 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
                   key={groupId}
                   variant={activeGroup === groupId ? 'secondary' : 'ghost'}
                   size="xs"
-                  className="dock-group-btn h-7 px-2 text-[0.62rem]"
+                  className="dock-group-btn"
+                  data-group={groupId}
+                  data-active={activeGroup === groupId ? '' : undefined}
                   onClick={() => handleGroupChange(groupId)}
                 >
                   {cfg.label}
@@ -1476,17 +1635,24 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
             </div>
             <div className="dock-tab-actions">
             {activeGroup === 'intelligence' && (
-              <Button variant="outline" size="xs" className="h-6 text-[0.58rem]" onClick={() => window.dispatchEvent(new CustomEvent('insights-hub-open'))}>
+              <Button variant="outline" size="xs" onClick={() => window.dispatchEvent(new CustomEvent('insights-hub-open'))}>
                 Hub
               </Button>
             )}
             {activeGroup === 'automation' && (
-              <Button variant="outline" size="xs" className="h-6 text-[0.58rem]" onClick={() => window.dispatchEvent(new CustomEvent('automation-studio-open'))}>
+              <Button variant="outline" size="xs" onClick={() => window.dispatchEvent(new CustomEvent('automation-studio-open'))}>
                 Studio
               </Button>
             )}
-            <Button variant="ghost" size="xs" className="h-6 text-[0.58rem] text-muted-foreground" onClick={() => updateWorkspace({ dockCollapsed: true })} title="Collapse dock">
-              <Minimize2 size={12} />
+            <Button
+              variant="ghost"
+              size="xs"
+              className="dock-collapse-btn"
+              onClick={() => updateWorkspace({ dockCollapsed: true })}
+              title="Collapse dock"
+            >
+              <Minimize2 aria-hidden />
+              <span className="dock-collapse-btn__label">Collapse</span>
             </Button>
             {activeTab === 'history' && (
               <Button
@@ -1504,22 +1670,22 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
 
           <TabsContent value="positions" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Positions">
-              <PositionsTab />
+              {activeTab === 'positions' && <PositionsTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="orders" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Orders">
-              <OrdersTab />
+              {activeTab === 'orders' && <OrdersTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="balances" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Balances">
-              <BalancesTab />
+              {activeTab === 'balances' && <BalancesTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="algo" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Algo Bot">
-              <AlgoTab />
+              {activeTab === 'algo' && <AlgoTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="scanner" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
@@ -1543,7 +1709,7 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
           </TabsContent>
           <TabsContent value="reconcile" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Reconciliation">
-              <ReconciliationTab />
+              {activeTab === 'reconcile' && <ReconciliationTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="bots" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
@@ -1566,12 +1732,12 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
           </TabsContent>
           <TabsContent value="equity" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Equity curve">
-              <EquityCurveTab />
+              {activeTab === 'equity' && <EquityCurveTab />}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="history" className="dock-tab-body mt-0 overflow-hidden data-[state=inactive]:hidden">
             <ErrorBoundary name="Trade history">
-              {!historyFullscreen && <TradeHistoryContent embedded />}
+              {activeTab === 'history' && !historyFullscreen && <TradeHistoryContent embedded />}
             </ErrorBoundary>
           </TabsContent>
         </Tabs>

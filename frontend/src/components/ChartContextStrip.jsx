@@ -2,6 +2,7 @@
  * ChartContextStrip — contextual breadcrumb under chart (UX-7).
  */
 import { useStore } from '../store/useStore';
+import { selectAgentInsight } from '../lib/agentInsights';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -13,8 +14,9 @@ export default function ChartContextStrip() {
   const activeBots = useStore((s) => s.activeBots);
   const isBotRunning = useStore((s) => s.isBotRunning);
   const chartLayout = useSettingsStore((s) => s.settings.chartLayout);
+  const chartTf = chartLayout?.timeframe || '1m';
 
-  const insight = agentInsights[activeSymbol];
+  const insight = selectAgentInsight(agentInsights, activeSymbol, chartTf);
   const runningBot = activeBots.find((b) => b.status === 'RUNNING' && b.symbol === activeSymbol);
 
   const activeIndicators = Object.entries(chartLayout?.activeIndicators || {})
@@ -52,7 +54,7 @@ export default function ChartContextStrip() {
           <Button
             variant="ghost"
             size="xs"
-            className="chart-context-strip__action h-6 px-1.5"
+            className="chart-context-strip__action"
             onClick={() => jumpDock('analyst')}
           >
             Analyst
@@ -68,7 +70,7 @@ export default function ChartContextStrip() {
           <Button
             variant="ghost"
             size="xs"
-            className={cn('chart-context-strip__action h-6 px-1.5', runningBot && 'text-trading-up')}
+            className={cn('chart-context-strip__action', runningBot && 'text-trading-up')}
             onClick={() => {
               window.dispatchEvent(new CustomEvent('automation-studio-open'));
               jumpDock('algo');
