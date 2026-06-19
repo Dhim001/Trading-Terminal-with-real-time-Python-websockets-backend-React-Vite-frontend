@@ -60,6 +60,7 @@ import { formatLastSignal } from '@/lib/formatTime';
 import { BAR_TIMEFRAMES, deployTimeframeSummary, formatBarTimeframeLabel } from '@/lib/barTimeframes';
 import { backtestFingerprint } from '@/lib/backtestDisplay';
 import { selectAgentInsight } from '@/lib/agentInsights';
+import { isSignalLog, logLineClass } from '@/lib/botLogInsight';
 import { buildBotLookup, getPositionBots, shortBotId } from '@/lib/botAttribution';
 import { DOCK_GROUP_CONFIG, dockGroupForTab } from '../settings/layoutModes';
 import { selectPositionStats } from '../store/selectors';
@@ -618,6 +619,7 @@ export function AlgoTab({ hideToolbar = false }) {
   const [stopAllOpen, setStopAllOpen] = useState(false);
   const [backtestDays, setBacktestDays] = useState('7');
   const [backtestOos, setBacktestOos] = useState(false);
+  const [backtestSimMode, setBacktestSimMode] = useState('live_aligned');
   const backtestTimeoutRef = useRef(null);
   const logScrollRef = useRef(null);
   const logCountRef = useRef(0);
@@ -676,7 +678,7 @@ export function AlgoTab({ hideToolbar = false }) {
     const { ok, error } = await sendAction(Action.RUN_BACKTEST, {
       strategy: botStrategy,
       symbol: activeSymbol,
-      config: botConfig,
+      config: { ...botConfig, sim_mode: backtestSimMode },
       days,
       timeframe: botTimeframe,
       oos_pct: backtestOos ? 30 : undefined,
@@ -691,7 +693,8 @@ export function AlgoTab({ hideToolbar = false }) {
   };
 
   const handleCancelBacktest = () => {
-    sendAction(Action.CANCEL_BACKTEST, {});
+    const jobId = useStore.getState().backtestJobId;
+    sendAction(Action.CANCEL_BACKTEST, jobId ? { job_id: jobId } : {});
   };
 
   const confirmDeploy = () => {
@@ -718,6 +721,7 @@ export function AlgoTab({ hideToolbar = false }) {
       config: {
         ...botConfig,
         trailing_stop_percent: botConfig.trailing_stop_percent ?? 2,
+        backtest_run_id: useStore.getState().backtestResults?.run_id ?? undefined,
       },
     });
   };
@@ -770,13 +774,7 @@ export function AlgoTab({ hideToolbar = false }) {
     return 'sell';
   };
 
-  const logLineClass = (log) => {
-    if (log.includes('BUY') || log.includes('SUCCESS')) return 'algo-log-line algo-log-line--success';
-    if (log.includes('SELL') || log.includes('ERROR') || log.includes('STOP')) return 'algo-log-line algo-log-line--error';
-    if (log.includes('WARN')) return 'algo-log-line algo-log-line--warn';
-    if (log.includes('INFO') || log.includes('started')) return 'algo-log-line algo-log-line--info';
-    return 'algo-log-line';
-  };
+  const logLineClassLocal = (log) => logLineClass(log);
 
   const selectBot = (bot_id) => {
     const bot = activeBots.find(b => b.id === bot_id);
@@ -1190,6 +1188,24 @@ export function AlgoTab({ hideToolbar = false }) {
             </label>
 
             <div className="algo-deploy-field">
+              <Label className="algo-field-label">Simulation mode</Label>
+              <Select value={backtestSimMode} onValueChange={setBacktestSimMode}>
+                <SelectTrigger className="h-8 w-full text-xs" aria-label="Backtest simulation mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper">
+                  <SelectItem value="live_aligned" className="text-xs">Live-aligned (risk gates)</SelectItem>
+                  <SelectItem value="research" className="text-xs">Research (shorts + no risk gates)</SelectItem>
+                </SelectContent>
+              </Select>
+              {backtestSimMode === 'research' && (
+                <p className="algo-field-hint text-[10px] text-muted-foreground mt-1">
+                  SELL signals open short positions; SL/TP apply to shorts.
+                </p>
+              )}
+            </div>
+
+            <div className="algo-deploy-field">
               <Label className="algo-field-label">Backtest Range</Label>
               <Select value={backtestDays} onValueChange={setBacktestDays}>
                 <SelectTrigger className="h-8 w-full text-xs" aria-label="Backtest history range">
@@ -1496,26 +1512,23 @@ export function AlgoTab({ hideToolbar = false }) {
                 <div style={{ height: logWindow.topPad }} aria-hidden />
                 {logWindow.slice.map((log, i) => {
                   const idx = logWindow.start + i;
-              const isSignal = /Entry (BUY|SELL)|signal @/i.test(log);
-              const chartAgentInsight = botStrategy === 'CHART_AGENT'
-                ? selectAgentInsight(agentInsights, activeSymbol, botTimeframe)
-                : null;
-              const showInsight = isSignal && chartAgentInsight;
-              return (
-                <div key={`${idx}-${log.slice(0, 24)}`} className={cn(logLineClass(log), showInsight && 'group relative')}>
-                  <span>{log}</span>
-                  {showInsight && (
-                    <button
-                      type="button"
-                      className="ml-2 text-[0.58rem] text-primary opacity-0 group-hover:opacity-100"
-                      onClick={() => window.dispatchEvent(new CustomEvent('dock-tab', { detail: 'analyst' }))}
-                    >
-                      Why?
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+                  const showInsight = isSignalLog(log) && (log.meta?.bar_time != null || /signal @/i.test(log.message || log.line || ''));
+                  const display = log.line ?? log.message ?? String(log);
+                  return (
+                    <div key={log.id ?? `${idx}-${display.slice(0, 24)}`} className={cn(logLineClassLocal(log), showInsight && 'group relative')}>
+                      <span>{display}</span>
+                      {showInsight && (
+                        <button
+                          type="button"
+                          className="ml-2 text-[0.58rem] text-primary opacity-0 group-hover:opacity-100"
+                          onClick={() => window.dispatchEvent(new CustomEvent('signal-insight-open', { detail: { log } }))}
+                        >
+                          Why?
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
                 <div style={{ height: logWindow.bottomPad }} aria-hidden />
               </>
             )}

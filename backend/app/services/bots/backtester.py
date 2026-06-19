@@ -10,8 +10,10 @@ from app.services.bots.backtest_costs import (
 from app.services.bots.indicators import first_eval_index, prepare_strategy_df
 from app.services.bots.risk_gate import RiskGate
 from app.services.bots.strategies import get_strategy, normalize_strategy_name
+from app.services.bots.backtest_analytics import drawdown_curve, enrich_summary
 from app.services.bots.take_profit import merge_tp_config, resolve_take_profit
 
+_SIM_MODES = frozenset({"live_aligned", "research"})
 _MIN_QTY = 0.001
 _DEFAULT_ALLOCATION = 10_000.0
 
@@ -35,6 +37,27 @@ def _check_long_sl_tp(position: dict, bar_low: float, bar_high: float) -> tuple[
     if tp is not None and bar_high >= tp:
         return "TP", tp
     return None, None
+
+
+def _check_short_sl_tp(position: dict, bar_low: float, bar_high: float) -> tuple[str | None, float | None]:
+    """Intra-bar SL/TP for a short position (conservative: SL before TP)."""
+    sl = position.get("stop_loss")
+    tp = position.get("take_profit")
+
+    if sl is not None and bar_high >= sl:
+        return "SL", sl
+    if tp is not None and bar_low <= tp:
+        return "TP", tp
+    return None, None
+
+
+def _update_trailing_stop_short(position: dict, bar_low: float, bar_high: float, trailing_pct: float) -> None:
+    if trailing_pct <= 0:
+        return
+    position["low_watermark"] = min(position.get("low_watermark", bar_high), bar_low)
+    new_sl = position["low_watermark"] * (1 + trailing_pct / 100)
+    current_sl = position.get("stop_loss")
+    position["stop_loss"] = min(current_sl, new_sl) if current_sl is not None else new_sl
 
 
 def _update_trailing_stop(position: dict, bar_low: float, bar_high: float, trailing_pct: float) -> None:
@@ -162,6 +185,10 @@ class BacktesterService:
             return {"error": "Not enough historical data"}
 
         cfg = config or {}
+        sim_mode = str(cfg.get("sim_mode") or "live_aligned").lower()
+        if sim_mode not in _SIM_MODES:
+            sim_mode = "live_aligned"
+        research = sim_mode == "research"
         allocation = float(cfg.get("allocation") or _DEFAULT_ALLOCATION)
         if allocation <= 0:
             allocation = _DEFAULT_ALLOCATION
@@ -239,7 +266,10 @@ class BacktesterService:
             exit_side = "SELL" if side == "BUY" else "BUY"
             exit_fill = exit_fill_price(exit_price, exit_side, slippage_bps)
             exit_fee = trade_fee(exit_fill * qty, fee_bps)
-            profit = (exit_fill - entry_fill) * qty - exit_fee
+            if side == "BUY":
+                profit = (exit_fill - entry_fill) * qty - exit_fee
+            else:
+                profit = (entry_fill - exit_fill) * qty - exit_fee
             equity += profit
             total_fees += exit_fee
             daily_pnl += profit
@@ -264,13 +294,13 @@ class BacktesterService:
                 exit_row["hold_seconds"] = hold_seconds
             trade_log.append(exit_row)
             position = None
-            if loss_limit > 0 and daily_pnl <= -loss_limit:
+            if not research and loss_limit > 0 and daily_pnl <= -loss_limit:
                 halted = True
                 bot_stub["status"] = "ERROR"
 
         def _try_entry(signal: str, signal_data: dict, row: dict, bar_time) -> None:
             nonlocal position, last_signal_bar_time, blocked_entries, equity, total_fees
-            if halted or signal != "BUY":
+            if (not research and halted) or signal != "BUY":
                 return
             if bar_time is not None and last_signal_bar_time == bar_time:
                 return
@@ -288,20 +318,22 @@ class BacktesterService:
                 return
 
             qty = risk_per_entry / price_diff
-            decision = self._risk_gate.validate_trade(
-                bot_stub,
-                "BUY",
-                qty,
-                current_price,
-                is_exit=False,
-                daily_pnl=daily_pnl,
-                position_size=0.0,
-            )
-            if not decision.allowed:
-                blocked_entries += 1
-                return
-
-            qty = decision.quantity if decision.quantity is not None else qty
+            if research:
+                qty = min(qty, allocation / max(current_price, 1e-9))
+            else:
+                decision = self._risk_gate.validate_trade(
+                    bot_stub,
+                    "BUY",
+                    qty,
+                    current_price,
+                    is_exit=False,
+                    daily_pnl=daily_pnl,
+                    position_size=0.0,
+                )
+                if not decision.allowed:
+                    blocked_entries += 1
+                    return
+                qty = decision.quantity if decision.quantity is not None else qty
             if qty < _MIN_QTY:
                 blocked_entries += 1
                 return
@@ -335,6 +367,60 @@ class BacktesterService:
             })
             last_signal_bar_time = bar_time
 
+        def _try_short_entry(signal: str, signal_data: dict, row: dict, bar_time) -> None:
+            nonlocal position, last_signal_bar_time, blocked_entries, equity, total_fees
+            if not research or signal != "SELL":
+                return
+            if bar_time is not None and last_signal_bar_time == bar_time:
+                return
+
+            current_price = float(row["close"])
+            stop_loss_price = signal_data.get("stop_loss_price")
+            if stop_loss_price is not None:
+                stop_loss = float(stop_loss_price)
+            else:
+                sl_dist = signal_data.get("stop_loss_distance", current_price * 0.02)
+                stop_loss = current_price + float(sl_dist)
+
+            price_diff = abs(stop_loss - current_price)
+            if price_diff <= 0:
+                return
+
+            qty = risk_per_entry / price_diff
+            qty = min(qty, allocation / max(current_price, 1e-9))
+            if qty < _MIN_QTY:
+                blocked_entries += 1
+                return
+
+            _, tp_price = resolve_take_profit(
+                merged_config, signal_data, "SELL", current_price,
+            )
+            entry_fill = entry_fill_price(current_price, "SELL", slippage_bps)
+            entry_fee = trade_fee(entry_fill * qty, fee_bps)
+            equity -= entry_fee
+            total_fees += entry_fee
+            position = {
+                "side": "SELL",
+                "entry_price": current_price,
+                "entry_fill": entry_fill,
+                "entry_time": bar_time,
+                "qty": qty,
+                "stop_loss": stop_loss,
+                "take_profit": tp_price,
+                "low_watermark": current_price,
+            }
+            trade_log.append({
+                "time": int(bar_time) if bar_time is not None else 0,
+                "side": "SELL",
+                "price": round(entry_fill, 4),
+                "quantity": round(qty, 6),
+                "pnl": None,
+                "is_exit": False,
+                "reason": "ENTRY_SHORT",
+                "fee": round(entry_fee, 4),
+            })
+            last_signal_bar_time = bar_time
+
         eval_bars = max(len(df) - start_i, 1)
         progress_stride = max(1, eval_bars // 40)
 
@@ -351,8 +437,12 @@ class BacktesterService:
 
             if position:
                 bars_in_market += 1
-                _update_trailing_stop(position, bar_low, bar_high, trailing_pct)
-                trigger, exit_px = _check_long_sl_tp(position, bar_low, bar_high)
+                if position["side"] == "BUY":
+                    _update_trailing_stop(position, bar_low, bar_high, trailing_pct)
+                    trigger, exit_px = _check_long_sl_tp(position, bar_low, bar_high)
+                else:
+                    _update_trailing_stop_short(position, bar_low, bar_high, trailing_pct)
+                    trigger, exit_px = _check_short_sl_tp(position, bar_low, bar_high)
                 if trigger:
                     _close_position(bar_time, exit_px, trigger)
 
@@ -363,15 +453,23 @@ class BacktesterService:
                 signal_data = strategy.evaluate(row)
             signal = (signal_data or {}).get("signal")
 
-            if signal in ("SELL", "CLOSE") and position:
-                if bar_time is not None and last_signal_bar_time == bar_time:
-                    signal = None
-                else:
-                    _close_position(bar_time, bar_close, "SIGNAL")
-                    last_signal_bar_time = bar_time
+            if position:
+                close_signal = (
+                    (position["side"] == "BUY" and signal in ("SELL", "CLOSE"))
+                    or (position["side"] == "SELL" and signal in ("BUY", "CLOSE"))
+                )
+                if close_signal:
+                    if bar_time is not None and last_signal_bar_time == bar_time:
+                        signal = None
+                    else:
+                        _close_position(bar_time, bar_close, "SIGNAL")
+                        last_signal_bar_time = bar_time
+                        signal = None
 
             if not position and signal == "BUY":
                 _try_entry(signal, signal_data, row, bar_time)
+            elif not position and signal == "SELL" and research:
+                _try_short_entry(signal, signal_data, row, bar_time)
 
             peak_equity = max(peak_equity, equity)
             drawdown = (peak_equity - equity) / peak_equity * 100 if peak_equity else 0
@@ -406,6 +504,13 @@ class BacktesterService:
             slippage_bps=slippage_bps,
             fee_bps=fee_bps,
         )
+        summary = enrich_summary(
+            summary,
+            equity_curve=equity_curve,
+            candles=candles,
+            starting_equity=starting_equity,
+        )
+        dd_curve = drawdown_curve(equity_curve)
 
         return {
             "win_rate": summary["win_rate"],
@@ -413,12 +518,13 @@ class BacktesterService:
             "max_drawdown": summary["max_drawdown"],
             "trade_count": total_trades,
             "equity_curve": equity_curve,
+            "drawdown_curve": dd_curve,
             "starting_equity": round(starting_equity, 2),
             "allocation": round(allocation, 2),
             "trades": trade_log,
             "trades_total": len(trade_log),
             "summary": summary,
-            "sim_mode": "live_aligned",
+            "sim_mode": sim_mode,
             "costs": {
                 "slippage_bps": slippage_bps,
                 "fee_bps": fee_bps,

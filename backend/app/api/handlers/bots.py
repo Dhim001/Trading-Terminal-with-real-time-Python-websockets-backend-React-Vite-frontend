@@ -14,6 +14,12 @@ from app.api.responses import (
 )
 from app.api.router import route
 from app.services.bots.backtest_jobs import cancel_job, clear_job, start_job
+from app.services.bots.backtest_job_store import (
+    create_backtest_job,
+    is_job_cancelled,
+    set_job_status,
+    update_job_progress,
+)
 from app.services.bots.backtest_sweep import expand_sweep_grid, sweep_label
 from app.services.events import channels
 from app.services.events import publish as event_publish
@@ -55,14 +61,31 @@ def _parse_backtest_request(msg: dict) -> dict:
         except (TypeError, ValueError):
             oos_pct = None
 
+    walk_forward = bool(msg.get("walk_forward"))
+    train_pct = msg.get("train_pct")
+    if train_pct is not None:
+        try:
+            train_pct = max(50.0, min(90.0, float(train_pct)))
+        except (TypeError, ValueError):
+            train_pct = 70.0
+    else:
+        train_pct = 70.0
+
+    config = msg.get("config", {}) or {}
+    sim_mode = msg.get("sim_mode") or config.get("sim_mode")
+    if sim_mode:
+        config = {**config, "sim_mode": sim_mode}
+
     return {
         "symbol": msg.get("symbol"),
         "strategy": msg.get("strategy"),
-        "config": msg.get("config", {}) or {},
+        "config": config,
         "days": days,
         "interval": msg.get("interval"),
         "timeframe": msg.get("timeframe", "1m"),
         "oos_pct": oos_pct,
+        "walk_forward": walk_forward,
+        "train_pct": train_pct,
         "sweep": msg.get("sweep"),
     }
 
@@ -86,6 +109,7 @@ def _apply_oos_window(candles: list, meta: dict, oos_pct: float | None) -> list:
 async def _execute_backtest(
     ctx: RequestContext,
     *,
+    job_id: str | None = None,
     symbol: str,
     strategy: str,
     config: dict,
@@ -94,23 +118,60 @@ async def _execute_backtest(
     timeframe: str,
     oos_pct: float | None = None,
     sweep: dict | None = None,
+    walk_forward: bool = False,
+    train_pct: float = 70.0,
 ) -> None:
     if not ctx.backtester or not hasattr(ctx.oms, "feed"):
         await send_backtest_result(ctx, {"status": "error", "message": "Backtester not available in current mode"})
         return
 
-    job = start_job(ctx.websocket)
+    request_payload = {
+        "symbol": symbol,
+        "strategy": strategy,
+        "config": config,
+        "days": days,
+        "interval": interval,
+        "timeframe": timeframe,
+        "oos_pct": oos_pct,
+        "sweep": sweep,
+        "walk_forward": walk_forward,
+        "train_pct": train_pct,
+    }
+    client_key = str(id(ctx.websocket)) if ctx.websocket is not None else None
+    if not job_id:
+        job_id = create_backtest_job(
+            request_payload,
+            status="running",
+            client_key=client_key,
+        )
+
+    job = start_job(ctx.websocket, job_id)
     progress_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
     drain_task = asyncio.create_task(_drain_backtest_progress(ctx, progress_queue))
 
     def enqueue_progress(data: dict) -> None:
+        payload = {**data, "job_id": job_id}
+        update_job_progress(job_id, payload)
         try:
-            progress_queue.put_nowait(data)
+            progress_queue.put_nowait(payload)
         except asyncio.QueueFull:
             pass
 
     def is_cancelled() -> bool:
-        return bool(job and job.is_cancelled())
+        if job and job.is_cancelled():
+            return True
+        return is_job_cancelled(job_id)
+
+    async def _finish(status: str, *, message: str | None = None, results: dict | None = None, run_id: str | None = None) -> None:
+        if status == "cancelled":
+            set_job_status(job_id, "cancelled", error=message)
+            await send_backtest_result(ctx, {"status": "cancelled", "message": message or "Backtest cancelled", "job_id": job_id})
+        elif status == "error":
+            set_job_status(job_id, "failed", error=message)
+            await send_backtest_result(ctx, {"status": "error", "message": message or "Backtest failed", "job_id": job_id})
+        elif status == "success" and results is not None:
+            set_job_status(job_id, "completed", run_id=run_id, results=results)
+            await send_backtest_result(ctx, {"status": "success", "results": results, "job_id": job_id})
 
     try:
         from app.services.archive.resolve import resolve_backtest_candles
@@ -126,11 +187,11 @@ async def _execute_backtest(
                 timeframe=timeframe,
             )
         except ValueError as exc:
-            await send_backtest_result(ctx, {"status": "error", "message": str(exc)})
+            await _finish("error", message=str(exc))
             return
 
         if is_cancelled():
-            await send_backtest_result(ctx, {"status": "cancelled", "message": "Backtest cancelled"})
+            await _finish("cancelled")
             return
 
         candles = _apply_oos_window(candles, meta, oos_pct)
@@ -138,96 +199,153 @@ async def _execute_backtest(
         configs = expand_sweep_grid(config, sweep) if sweep else [config]
         is_sweep = len(configs) > 1 or bool(sweep)
 
-        enqueue_progress({
-            "pct": 8,
-            "phase": "indicators" if not is_sweep else "sweep",
-            "message": f"Running {len(configs)} configuration{'s' if len(configs) != 1 else ''}…",
-            "bars": bar_count,
-            "total_runs": len(configs),
-        })
+        if walk_forward and not is_sweep:
+            await _finish("error", message="Walk-forward requires a parameter sweep grid")
+            return
 
-        sweep_rows: list[dict] = []
-        best_result = None
-        best_config = None
+        if walk_forward and is_sweep:
+            from app.services.bots.backtest_walk_forward import run_walk_forward
 
-        for run_idx, run_config in enumerate(configs):
-            if is_cancelled():
-                await send_backtest_result(ctx, {"status": "cancelled", "message": "Backtest cancelled"})
-                return
+            enqueue_progress({
+                "pct": 10,
+                "phase": "sweep",
+                "message": f"Walk-forward: optimizing on {int(train_pct)}% train window…",
+                "bars": bar_count,
+                "total_runs": len(configs),
+            })
 
-            def progress_cb(done: int, total: int, *, _run=run_idx, _runs=len(configs)) -> None:
-                run_span = 85 / max(_runs, 1)
-                base = 10 + _run * run_span
-                pct = base + int((done / max(total, 1)) * run_span)
+            def wf_progress(done: int, total: int) -> None:
+                pct = 10 + int((done / max(total, 1)) * 80)
                 enqueue_progress({
-                    "pct": min(int(pct), 95),
-                    "phase": "sweep" if is_sweep else "simulate",
-                    "message": (
-                        f"Sweep {run_idx + 1}/{len(configs)}: bar {done}/{total}…"
-                        if is_sweep
-                        else f"Simulating bar {done}/{total}…"
-                    ),
+                    "pct": min(pct, 92),
+                    "phase": "sweep",
+                    "message": f"Walk-forward bar {done}/{total}…",
                     "bar": done,
                     "bars": total,
-                    "run": run_idx + 1,
-                    "total_runs": len(configs),
                 })
 
-            results = await asyncio.to_thread(
+            best_result = await asyncio.to_thread(
                 partial(
-                    ctx.backtester.run_backtest,
-                    symbol,
-                    strategy,
-                    run_config,
-                    candles,
-                    progress_cb=progress_cb,
+                    run_walk_forward,
+                    run_backtest=ctx.backtester.run_backtest,
+                    symbol=symbol,
+                    strategy=strategy,
+                    base_config=config,
+                    candles=candles,
+                    meta=meta,
+                    configs=configs,
+                    train_pct=train_pct,
+                    progress_cb=wf_progress,
                     cancel_cb=is_cancelled,
                 ),
             )
-
-            if isinstance(results, dict) and results.get("cancelled"):
-                await send_backtest_result(ctx, {"status": "cancelled", "message": "Backtest cancelled"})
+            if isinstance(best_result, dict) and best_result.get("cancelled"):
+                await _finish("cancelled")
                 return
+            if isinstance(best_result, dict) and best_result.get("error"):
+                await _finish("error", message=best_result["error"])
+                return
+            best_config = (best_result.get("walk_forward") or {}).get("best_config") or config
+            sweep_rows = (best_result.get("sweep") or {}).get("results") or []
+        else:
+            sweep_rows = []
+            best_result = None
+            best_config = None
 
-            if isinstance(results, dict) and results.get("error"):
-                if is_sweep:
-                    sweep_rows.append({
-                        "label": sweep_label(run_config),
-                        "config": run_config,
-                        "error": results["error"],
+        if not (walk_forward and is_sweep):
+            enqueue_progress({
+                "pct": 8,
+                "phase": "indicators" if not is_sweep else "sweep",
+                "message": f"Running {len(configs)} configuration{'s' if len(configs) != 1 else ''}…",
+                "bars": bar_count,
+                "total_runs": len(configs),
+            })
+
+            sweep_rows = []
+            best_result = None
+            best_config = None
+
+            for run_idx, run_config in enumerate(configs):
+                if is_cancelled():
+                    await _finish("cancelled")
+                    return
+
+                def progress_cb(done: int, total: int, *, _run=run_idx, _runs=len(configs)) -> None:
+                    run_span = 85 / max(_runs, 1)
+                    base = 10 + _run * run_span
+                    pct = base + int((done / max(total, 1)) * run_span)
+                    enqueue_progress({
+                        "pct": min(int(pct), 95),
+                        "phase": "sweep" if is_sweep else "simulate",
+                        "message": (
+                            f"Sweep {run_idx + 1}/{len(configs)}: bar {done}/{total}…"
+                            if is_sweep
+                            else f"Simulating bar {done}/{total}…"
+                        ),
+                        "bar": done,
+                        "bars": total,
+                        "run": run_idx + 1,
+                        "total_runs": len(configs),
                     })
-                    continue
-                await send_backtest_result(ctx, {"status": "error", "message": results["error"]})
-                return
 
-            if not isinstance(results, dict):
-                await send_backtest_result(ctx, {"status": "error", "message": "Invalid backtest response"})
-                return
+                results = await asyncio.to_thread(
+                    partial(
+                        ctx.backtester.run_backtest,
+                        symbol,
+                        strategy,
+                        run_config,
+                        candles,
+                        progress_cb=progress_cb,
+                        cancel_cb=is_cancelled,
+                    ),
+                )
 
-            row = {
-                "label": sweep_label(run_config),
-                "config": run_config,
-                "summary": results.get("summary") or {},
-                "total_pnl": results.get("total_pnl"),
-                "trade_count": results.get("trade_count"),
-            }
-            sweep_rows.append(row)
+                if isinstance(results, dict) and results.get("cancelled"):
+                    await _finish("cancelled")
+                    return
 
-            pnl = float(results.get("total_pnl") or 0)
-            if best_result is None or pnl > float(best_result.get("total_pnl") or -1e18):
-                best_result = results
-                best_config = run_config
+                if isinstance(results, dict) and results.get("error"):
+                    if is_sweep:
+                        sweep_rows.append({
+                            "label": sweep_label(run_config),
+                            "config": run_config,
+                            "error": results["error"],
+                        })
+                        continue
+                    await _finish("error", message=results["error"])
+                    return
+
+                if not isinstance(results, dict):
+                    await _finish("error", message="Invalid backtest response")
+                    return
+
+                row = {
+                    "label": sweep_label(run_config),
+                    "config": run_config,
+                    "summary": results.get("summary") or {},
+                    "total_pnl": results.get("total_pnl"),
+                    "trade_count": results.get("trade_count"),
+                }
+                sweep_rows.append(row)
+
+                pnl = float(results.get("total_pnl") or 0)
+                if best_result is None or pnl > float(best_result.get("total_pnl") or -1e18):
+                    best_result = results
+                    best_config = run_config
 
         if best_result is None:
-            await send_backtest_result(ctx, {"status": "error", "message": "Sweep produced no valid runs"})
+            await _finish("error", message="Sweep produced no valid runs")
             return
 
         enqueue_progress({"pct": 98, "phase": "save", "message": "Saving run…"})
         meta["strategy"] = strategy
         if oos_pct:
             meta["oos_pct"] = oos_pct
+        if walk_forward and is_sweep:
+            meta["walk_forward"] = True
+            meta["train_pct"] = train_pct
         best_result["meta"] = meta
-        if is_sweep:
+        if is_sweep and not (walk_forward and is_sweep):
             best_result["sweep"] = {
                 "configs_tested": len(configs),
                 "best_config": best_config,
@@ -249,7 +367,7 @@ async def _execute_backtest(
             "run_id": run_id,
         }
         enqueue_progress({"pct": 100, "phase": "done", "message": "Complete"})
-        await send_backtest_result(ctx, {"status": "success", "results": wire_results})
+        await _finish("success", results=wire_results, run_id=run_id)
     finally:
         clear_job(ctx.websocket)
         await progress_queue.put(None)
@@ -377,6 +495,12 @@ async def run_backtest_sweep(ctx: RequestContext) -> None:
 
 @route(Action.CANCEL_BACKTEST, tags=["bots"])
 async def cancel_backtest(ctx: RequestContext) -> None:
+    job_id = ctx.message.get("job_id")
+    if job_id:
+        from app.services.bots.backtest_job_store import request_cancel_job
+        if request_cancel_job(job_id):
+            await send_order_result(ctx, {"status": "success", "message": "Backtest cancel requested"})
+            return
     if cancel_job(ctx.websocket):
         await send_order_result(ctx, {"status": "success", "message": "Backtest cancel requested"})
     else:
