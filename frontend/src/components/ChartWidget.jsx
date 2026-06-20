@@ -807,6 +807,9 @@ const DATAZOOM_HANDLER_MIN_MS = 400;
   );
 
   const prevConfigRef = useRef({ symbol: activeSymbol, timeframe: timeframe });
+  const layoutPushSkipRef = useRef(false);
+
+  const chartLayoutFromSettings = settings.chartLayout;
 
   useEffect(() => {
     setHistoryGateForced(false);
@@ -833,6 +836,16 @@ const DATAZOOM_HANDLER_MIN_MS = 400;
     ...(settings.chartLayout?.activeIndicators || {}),
   }));
 
+  // Live mirrors of local chart state — let the settings→chart sync compare
+  // against the latest values without depending on them (which would revert
+  // header-toggle changes before they propagate to settings).
+  const timeframeRef = useRef(timeframe);
+  const chartTypeRef = useRef(chartType);
+  const activeRef = useRef(active);
+  timeframeRef.current = timeframe;
+  chartTypeRef.current = chartType;
+  activeRef.current = active;
+
   useEffect(() => {
     lastConfigureRevisionRef.current = '';
   }, [activeSymbol, timeframe, active]);
@@ -841,6 +854,43 @@ const DATAZOOM_HANDLER_MIN_MS = 400;
   useEffect(() => { try { localStorage.setItem('terminal_tf', timeframe); } catch {} }, [timeframe]);
   useEffect(() => { try { localStorage.setItem('terminal_chart_type', chartType); } catch {} }, [chartType]);
   useEffect(() => { try { localStorage.setItem('terminal_chart_indicators_active', JSON.stringify(active)); } catch {} }, [active]);
+
+  useEffect(() => {
+    const cl = chartLayoutFromSettings;
+    if (!cl) return;
+
+    let pulled = false;
+    if (cl.timeframe && cl.timeframe !== timeframeRef.current) {
+      setTimeframe(cl.timeframe);
+      pulled = true;
+    }
+    if (cl.chartType && cl.chartType !== chartTypeRef.current) {
+      setChartType(cl.chartType);
+      pulled = true;
+    }
+    if (cl.activeIndicators) {
+      const keys = Object.keys(indicatorToolbar);
+      const differs = keys.some((k) => Boolean(cl.activeIndicators[k]) !== Boolean(activeRef.current[k]));
+      if (differs) {
+        setActive((prev) => ({ ...prev, ...cl.activeIndicators }));
+        pulled = true;
+      }
+    }
+    if (pulled) layoutPushSkipRef.current = true;
+  }, [
+    chartLayoutFromSettings?.timeframe,
+    chartLayoutFromSettings?.chartType,
+    chartLayoutFromSettings?.activeIndicators,
+    indicatorToolbar,
+  ]);
+
+  useEffect(() => {
+    if (layoutPushSkipRef.current) {
+      layoutPushSkipRef.current = false;
+      return;
+    }
+    updateChartLayout({ timeframe, chartType, activeIndicators: active });
+  }, [timeframe, chartType, active, updateChartLayout]);
 
   useEffect(() => {
     const chart = chartRef.current;
@@ -852,12 +902,9 @@ const DATAZOOM_HANDLER_MIN_MS = 400;
   }, [zenMode]);
 
   useEffect(() => {
-    updateChartLayout({ timeframe, chartType, activeIndicators: active });
-  }, [timeframe, chartType, active, updateChartLayout]);
-
-  useEffect(() => {
     const onReset = (e) => {
       const cl = e.detail?.chartLayout ?? DEFAULT_TERMINAL_SETTINGS.chartLayout;
+      layoutPushSkipRef.current = true;
       setTimeframe(cl.timeframe);
       setChartType(cl.chartType);
       setActive({ ...cl.activeIndicators });
