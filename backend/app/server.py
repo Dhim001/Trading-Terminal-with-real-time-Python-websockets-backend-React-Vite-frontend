@@ -21,6 +21,7 @@ from app.config import (
     ARCHIVE_TICKS_ENABLED,
     ARCHIVE_PARQUET_ENABLED,
     ARCHIVE_BACKEND,
+    AGENT_LLM_ENABLED,
 )
 from app.database import init_db
 from app.api.http_server import run_http_server
@@ -168,6 +169,14 @@ async def websocket_handler(websocket):
     logging.info("New client connected.")
     manager.register(websocket)
 
+    llm_config: dict = {"available": False, "provider": "off"}
+    try:
+        from app.services.agent.llm.router import get_llm_status
+
+        llm_config = await get_llm_status()
+    except Exception:
+        pass
+
     await manager.send_to(websocket, terminal_config({
         "terminalMode": TERMINAL_MODE,
         "terminalRole": TERMINAL_ROLE,
@@ -180,6 +189,11 @@ async def websocket_handler(websocket):
         "archiveParquetEnabled": ARCHIVE_PARQUET_ENABLED,
         "archiveBackend": ARCHIVE_BACKEND,
         "wsMsgpackEnabled": WS_MSGPACK_ENABLED,
+        "agentLlmEnabled": AGENT_LLM_ENABLED,
+        "agentLlmAvailable": llm_config.get("available", False),
+        "agentLlmProvider": llm_config.get("provider"),
+        "agentLlmModel": llm_config.get("model"),
+        "agentLlmModels": llm_config.get("models") or [],
     }))
 
     await manager.send_to(websocket, account_update(state.oms.get_account_data()))
@@ -205,6 +219,21 @@ async def heartbeat_loop():
 
 async def main():
     init_db()
+    try:
+        from app.config import BACKTEST_JOB_RETENTION_DAYS, OPTIMIZATION_RETENTION_DAYS
+        from app.services.bots.backtest_job_store import prune_backtest_jobs
+        from app.services.bots.optimization_store import prune_optimization_runs
+
+        opt_del = prune_optimization_runs(OPTIMIZATION_RETENTION_DAYS)
+        job_del = prune_backtest_jobs(BACKTEST_JOB_RETENTION_DAYS)
+        if opt_del or job_del:
+            logging.info(
+                "Retention prune: %s optimization run(s), %s backtest job(s)",
+                opt_del,
+                job_del,
+            )
+    except Exception:
+        logging.exception("Retention prune failed")
     state.bot_manager.load_bots_from_db()
 
     if state.event_bus:

@@ -52,7 +52,12 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   botMinCandles: 200,
   archiveTicksEnabled: false,
   ambiguousOrders: [],
-  isLive: false,
+  agentLlmEnabled: false,
+  agentLlmAvailable: false,
+  agentLlmProvider: 'off',
+  agentLlmModel: null,
+  agentLlmModels: [],
+  selectedLlmModel: getLocal('terminal_llm_model', null),
   symbolsList: ["BTCUSDT", "ETHUSDT", "AAPL", "TSLA", "MSFT"],
 
   // Market data states
@@ -94,6 +99,10 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   backtestProgress: null,
   backtestJobId: null,
   backtestLabOpen: false,
+  backtestLabTab: 'results',
+  backtestDays: '7',
+  backtestOos: false,
+  pendingDeploy: false,
   /** Fingerprint of params used for the last completed backtest run */
   backtestSnapshot: null,
   backtestOverlay: null,
@@ -254,7 +263,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
 
   setTerminalMode: (mode) => set({ terminalMode: mode, isLive: mode !== 'SIMULATED' }),
 
-  setTerminalConfig: ({ terminalMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge }) => set((state) => ({
+  setTerminalConfig: ({ terminalMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge, agentLlmEnabled, agentLlmAvailable, agentLlmProvider, agentLlmModel, agentLlmModels }) => set((state) => ({
     terminalMode: terminalMode ?? state.terminalMode,
     isLive: (terminalMode ?? state.terminalMode) !== 'SIMULATED',
     allowLiveBots: allowLiveBots ?? state.allowLiveBots,
@@ -267,7 +276,22 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     archiveBackend: archiveBackend ?? state.archiveBackend,
     workerAlive: workerAlive !== undefined ? workerAlive : state.workerAlive,
     workerHeartbeatAge: workerHeartbeatAge !== undefined ? workerHeartbeatAge : state.workerHeartbeatAge,
+    agentLlmEnabled: agentLlmEnabled ?? state.agentLlmEnabled,
+    agentLlmAvailable: agentLlmAvailable ?? state.agentLlmAvailable,
+    agentLlmProvider: agentLlmProvider ?? state.agentLlmProvider,
+    agentLlmModel: agentLlmModel ?? state.agentLlmModel,
+    agentLlmModels: agentLlmModels ?? state.agentLlmModels,
     ...(Array.isArray(symbols) ? { symbolsList: symbols } : {}),
+  })),
+
+  setSelectedLlmModel: (model) => {
+    setLocal('terminal_llm_model', model);
+    set({ selectedLlmModel: model });
+  },
+
+  agentDeepReasoning: {},
+  setAgentDeepReasoning: (insightId, data) => set((state) => ({
+    agentDeepReasoning: { ...state.agentDeepReasoning, [insightId]: data },
   })),
 
   setAmbiguousOrders: (orders) => set({ ambiguousOrders: Array.isArray(orders) ? orders : [] }),
@@ -320,6 +344,16 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   setBacktestProgress: (progress) => set({ backtestProgress: progress ?? null }),
   setBacktestJobId: (jobId) => set({ backtestJobId: jobId ?? null }),
   setBacktestLabOpen: (open) => set({ backtestLabOpen: Boolean(open) }),
+  setBacktestLabTab: (tab) => set({
+    backtestLabTab: ['results', 'optimizer', 'jobs'].includes(tab) ? tab : 'results',
+  }),
+  openBacktestLab: (tab = 'results') => set({
+    backtestLabOpen: true,
+    backtestLabTab: ['results', 'optimizer', 'jobs'].includes(tab) ? tab : 'results',
+  }),
+  setBacktestDays: (days) => set({ backtestDays: String(days ?? '7') }),
+  setBacktestOos: (oos) => set({ backtestOos: Boolean(oos) }),
+  setPendingDeploy: (pending) => set({ pendingDeploy: Boolean(pending) }),
   setBacktestSnapshot: (snapshot) => set({ backtestSnapshot: snapshot }),
   setBacktestOverlay: (overlay) => set({ backtestOverlay: overlay }),
   clearBacktestOverlay: () => set({ backtestOverlay: null }),

@@ -34,6 +34,7 @@ from app.api.http.auth import ApiKeyMiddleware
 from app.database import get_db_stats
 from app.services.bots.strategy_catalog import list_strategy_catalog
 from app.services.bots.backtest_store import get_backtest_run, get_backtest_trades, list_backtest_runs
+from app.services.bots.optimization_store import get_optimization_run, list_optimization_runs
 from app.services.bots.backtest_job_store import get_active_backtest_job, get_backtest_job, list_backtest_jobs
 from app.services.events import channels
 
@@ -49,6 +50,8 @@ async def metrics(request: Request) -> PlainTextResponse:
 async def health(request: Request) -> JSONResponse:
     import time
 
+    from app.services.agent.llm.router import get_llm_status
+
     state: AppState = request.app.state.terminal
     body = {
         "ok": True,
@@ -63,6 +66,15 @@ async def health(request: Request) -> JSONResponse:
         "archive_parquet_enabled": ARCHIVE_PARQUET_ENABLED,
         "archive_backend": ARCHIVE_BACKEND,
     }
+
+    try:
+        from app.config import AGENT_LLM_ENABLED
+
+        body["llm"] = await get_llm_status()
+        body["agent_llm_enabled"] = AGENT_LLM_ENABLED
+    except Exception:
+        body["llm"] = {"available": False, "provider": "off"}
+        body["agent_llm_enabled"] = False
 
     try:
         stats = get_db_stats()
@@ -109,6 +121,39 @@ async def list_agent_insights(request: Request) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "Chart analyst unavailable"}, status_code=503)
     insights = analyst.list_insights(symbol, limit=limit)
     return JSONResponse({"ok": True, "symbol": symbol, "insights": insights, "count": len(insights)})
+
+
+async def list_llm_models(request: Request) -> JSONResponse:
+    from app.services.agent.llm.router import list_all_models
+
+    try:
+        data = await list_all_models()
+        return JSONResponse({"ok": True, **data})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+
+
+async def set_llm_model(request: Request) -> JSONResponse:
+    from app.services.agent.llm.router import list_all_models, set_preferred_model
+
+    try:
+        body = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
+    model = (body.get("model") or "").strip()
+    if not model:
+        set_preferred_model(None)
+    else:
+        available = await list_all_models()
+        all_names = set(available.get("ollama") or []) | set(available.get("openrouter") or [])
+        if all_names and model not in all_names:
+            return JSONResponse(
+                {"ok": False, "error": f"Model {model!r} not in available models"},
+                status_code=400,
+            )
+        set_preferred_model(model)
+    data = await list_all_models()
+    return JSONResponse({"ok": True, **data})
 
 
 async def list_backtest_runs_handler(request: Request) -> JSONResponse:
@@ -181,6 +226,26 @@ async def list_backtest_jobs_handler(request: Request) -> JSONResponse:
         limit = 20
     jobs = list_backtest_jobs(limit=limit, status=status or None)
     return JSONResponse({"ok": True, "jobs": jobs, "count": len(jobs)})
+
+
+async def list_optimization_runs_handler(request: Request) -> JSONResponse:
+    symbol = request.query_params.get("symbol")
+    try:
+        limit = int(request.query_params.get("limit", "20"))
+    except (TypeError, ValueError):
+        limit = 20
+    runs = list_optimization_runs(limit=limit, symbol=symbol or None)
+    return JSONResponse({"ok": True, "runs": runs, "count": len(runs)})
+
+
+async def get_optimization_run_handler(request: Request) -> JSONResponse:
+    run_id = request.path_params.get("run_id")
+    if not run_id:
+        return JSONResponse({"ok": False, "error": "run_id is required"}, status_code=400)
+    run = get_optimization_run(run_id)
+    if not run:
+        return JSONResponse({"ok": False, "error": "Optimization run not found"}, status_code=404)
+    return JSONResponse({"ok": True, "run": run})
 
 
 async def list_api_routes(request: Request) -> JSONResponse:
@@ -271,12 +336,16 @@ def create_http_app(state: AppState) -> Starlette:
         Route("/metrics", metrics, methods=["GET"]),
         Route("/api/v1/strategies", list_strategies, methods=["GET"]),
         Route("/api/v1/agent/insights/{symbol}", list_agent_insights, methods=["GET"]),
+        Route("/api/v1/llm/models", list_llm_models, methods=["GET"]),
+        Route("/api/v1/llm/model", set_llm_model, methods=["POST"]),
         Route("/api/v1/backtest/runs", list_backtest_runs_handler, methods=["GET"]),
         Route("/api/v1/backtest/runs/{run_id}", get_backtest_run_handler, methods=["GET"]),
         Route("/api/v1/backtest/runs/{run_id}/trades", get_backtest_trades_handler, methods=["GET"]),
         Route("/api/v1/backtest/jobs", list_backtest_jobs_handler, methods=["GET"]),
         Route("/api/v1/backtest/jobs/active", get_active_backtest_job_handler, methods=["GET"]),
         Route("/api/v1/backtest/jobs/{job_id}", get_backtest_job_handler, methods=["GET"]),
+        Route("/api/v1/backtest/optimizations", list_optimization_runs_handler, methods=["GET"]),
+        Route("/api/v1/backtest/optimizations/{run_id}", get_optimization_run_handler, methods=["GET"]),
         Route("/api/v1/routes", list_api_routes, methods=["GET"]),
         Route("/api/v1/openapi.json", openapi_json, methods=["GET"]),
     ]

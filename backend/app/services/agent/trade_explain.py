@@ -71,7 +71,7 @@ def _fetch_trade(bot_id: str, trade_id: str) -> dict | None:
     cursor.execute(
         """
         SELECT id, bot_id, symbol, side, price, quantity, timestamp, is_exit,
-               signal_id, signal_bar_time, order_id
+               signal_id, signal_bar_time, order_id, insight_snapshot
         FROM bot_trades
         WHERE bot_id = ? AND id = ?
         """,
@@ -82,7 +82,9 @@ def _fetch_trade(bot_id: str, trade_id: str) -> dict | None:
     if not row:
         return None
     if isinstance(row, dict):
-        return dict(row)
+        out = dict(row)
+        out["insight_snapshot"] = _parse_payload(out.get("insight_snapshot"))
+        return out
     return {
         "id": row[0],
         "bot_id": row[1],
@@ -95,6 +97,7 @@ def _fetch_trade(bot_id: str, trade_id: str) -> dict | None:
         "signal_id": row[8],
         "signal_bar_time": row[9],
         "order_id": row[10],
+        "insight_snapshot": _parse_payload(row[11]) if len(row) > 11 else None,
     }
 
 
@@ -141,6 +144,74 @@ def _fetch_recent_logs(bot_id: str, limit: int = 12) -> list[str]:
     return [r[0] if not isinstance(r, dict) else r.get("message", "") for r in rows if r]
 
 
+def _fetch_related_insights(symbol: str, timeframe: str, *, limit: int = 5) -> list[dict]:
+    """Recent analyst insights for symbol (RAG context)."""
+    sym = symbol.upper()
+    tf = normalize_timeframe(timeframe)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT payload FROM agent_insights
+        WHERE symbol = ?
+        ORDER BY bar_time DESC
+        LIMIT ?
+        """,
+        (sym, limit * 3),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    out: list[dict] = []
+    for row in rows:
+        payload = _parse_payload(row[0] if not isinstance(row, dict) else row.get("payload"))
+        if not payload:
+            continue
+        if normalize_timeframe(payload.get("timeframe", "1m")) != tf:
+            continue
+        out.append({
+            "bar_time": payload.get("bar_time"),
+            "signal": payload.get("signal"),
+            "confidence": payload.get("confidence"),
+            "score": payload.get("score"),
+            "reasons": (payload.get("reasons") or [])[:3],
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _fetch_related_trades(bot_id: str, symbol: str, *, limit: int = 5) -> list[dict]:
+    """Recent fills on same bot/symbol for context."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT side, price, quantity, timestamp, is_exit, signal_bar_time
+        FROM bot_trades
+        WHERE bot_id = ? AND symbol = ?
+        ORDER BY timestamp DESC
+        LIMIT ?
+        """,
+        (bot_id, symbol.upper(), limit),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            out.append(dict(row))
+        else:
+            out.append({
+                "side": row[0],
+                "price": row[1],
+                "quantity": row[2],
+                "timestamp": row[3],
+                "is_exit": row[4],
+                "signal_bar_time": row[5],
+            })
+    return out
+
+
 def _template_summary(trade: dict, insight: dict | None, bot: dict) -> str:
     side = trade.get("side", "?")
     sym = trade.get("symbol", "?")
@@ -165,6 +236,7 @@ async def explain_trade(
     *,
     chart_analyst=None,
     use_llm: bool = False,
+    llm_model: str | None = None,
 ) -> dict[str, Any]:
     trade = _fetch_trade(bot_id, trade_id)
     if not trade:
@@ -180,20 +252,25 @@ async def explain_trade(
 
     insight = None
     if not trade.get("is_exit"):
-        insight = _find_insight(
-            symbol,
-            trade.get("signal_bar_time"),
-            timeframe,
-            chart_analyst=chart_analyst,
-        )
+        insight = _parse_payload(trade.get("insight_snapshot"))
+        if not insight:
+            insight = _find_insight(
+                symbol,
+                trade.get("signal_bar_time"),
+                timeframe,
+                chart_analyst=chart_analyst,
+            )
 
     logs = _fetch_recent_logs(bot_id)
+    related_insights = _fetch_related_insights(symbol, timeframe, limit=5)
+    related_trades = _fetch_related_trades(bot_id, symbol, limit=5)
     summary = _template_summary(trade, insight, bot)
 
     narrative = None
+    llm_provider = None
     if use_llm and insight:
         try:
-            from app.services.agent.llm_client import summarize_insight
+            from app.services.agent.llm.router import summarize_insight
 
             bundle = {
                 **insight,
@@ -204,8 +281,10 @@ async def explain_trade(
                     "signal_bar_time": trade.get("signal_bar_time"),
                 },
                 "recent_logs": logs[:6],
+                "related_insights": related_insights,
+                "related_trades": related_trades,
             }
-            narrative, _model = await summarize_insight(bundle)
+            narrative, _model, llm_provider = await summarize_insight(bundle, model=llm_model)
         except Exception:
             narrative = None
 
@@ -221,12 +300,17 @@ async def explain_trade(
         },
         "insight": insight,
         "recent_logs": logs,
+        "related_insights": related_insights,
+        "related_trades": related_trades,
         "narrative": narrative,
+        "llm_provider": llm_provider,
         "sources": [
             s for s, ok in [
                 ("bot_trades", bool(trade)),
                 ("agent_insights", bool(insight)),
                 ("bot_logs", bool(logs)),
+                ("related_insights", bool(related_insights)),
+                ("related_trades", bool(related_trades)),
             ] if ok
         ],
     }

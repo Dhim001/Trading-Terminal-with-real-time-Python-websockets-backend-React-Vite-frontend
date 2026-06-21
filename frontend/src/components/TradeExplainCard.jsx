@@ -5,7 +5,9 @@ import React, { useState } from 'react';
 import { useStore } from '../store/useStore';
 import { Action } from '../api/protocol';
 import { invokeHttpAction } from '../api/transport';
+import { withLlmModel } from '../api/endpoints';
 import SubReportCards from './SubReportCards';
+import LlmNarrativeBlock from './LlmNarrativeBlock';
 import { cn } from '@/lib/utils';
 import { Loader2 } from 'lucide-react';
 import { normalizeAnalystTimeframe, selectAgentInsight } from '@/lib/agentInsights';
@@ -23,6 +25,9 @@ export function tradeIdKey(trade) {
 
 export function findInsightForTrade(trade, symbol, timeframe, agentInsights, agentInsightHistory) {
   if (!trade) return null;
+  if (trade.insight_snapshot && typeof trade.insight_snapshot === 'object') {
+    return trade.insight_snapshot;
+  }
   const tf = normalizeAnalystTimeframe(timeframe);
   const barTime = trade.signal_bar_time;
   if (barTime != null) {
@@ -66,11 +71,11 @@ export default function TradeExplainCard({
     setLoading(true);
     setError(null);
     try {
-      await invokeHttpAction(Action.EXPLAIN_TRADE, {
+      await invokeHttpAction(Action.EXPLAIN_TRADE, withLlmModel({
         bot_id: botId,
         trade_id: tradeKey,
         use_llm: Boolean(useLlm),
-      });
+      }));
     } catch (err) {
       setError(err?.message || 'Could not load explanation');
     } finally {
@@ -91,6 +96,8 @@ export default function TradeExplainCard({
     || insight?.reasons?.length
     || insight?.narrative
     || insight?.sub_reports
+    || (explain?.related_insights?.length > 0)
+    || (explain?.related_trades?.length > 0)
     || (explain?.recent_logs?.length > 0),
   );
 
@@ -118,7 +125,13 @@ export default function TradeExplainCard({
           <p className="bot-trade-explain__summary-text">{explain.summary}</p>
         )}
         {explain?.narrative && (
-          <p className="bot-trade-explain__narrative">{explain.narrative}</p>
+          <div className="bot-trade-explain__narrative-wrap">
+            <LlmNarrativeBlock
+              narrative={explain.narrative}
+              provider={explain.llm_provider}
+              compact
+            />
+          </div>
         )}
         {explain?.sources?.length > 0 && (
           <p className="bot-trade-explain__sources text-muted-foreground">
@@ -137,7 +150,13 @@ export default function TradeExplainCard({
           </ul>
         ) : null}
         {!explain?.summary && insight?.narrative && (
-          <p className="bot-trade-explain__narrative">{insight.narrative}</p>
+          <div className="bot-trade-explain__narrative-wrap">
+            <LlmNarrativeBlock
+              narrative={insight.narrative}
+              model={insight.model}
+              compact
+            />
+          </div>
         )}
         {explain?.recent_logs?.length > 0 && (
           <div className="bot-trade-explain__logs">
@@ -145,6 +164,31 @@ export default function TradeExplainCard({
             <ul className="bot-trade-explain__logs-list">
               {explain.recent_logs.map((line, i) => (
                 <li key={i}>{line}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {explain?.related_insights?.length > 0 && (
+          <div className="bot-trade-explain__logs">
+            <p className="bot-trade-explain__logs-title">Recent analyst signals</p>
+            <ul className="bot-trade-explain__logs-list">
+              {explain.related_insights.map((ins, i) => (
+                <li key={i}>
+                  {ins.signal} · {Math.round((ins.confidence ?? 0) * 100)}% conf
+                  {ins.reasons?.[0] ? ` — ${ins.reasons[0]}` : ''}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {explain?.related_trades?.length > 0 && (
+          <div className="bot-trade-explain__logs">
+            <p className="bot-trade-explain__logs-title">Recent fills on this bot</p>
+            <ul className="bot-trade-explain__logs-list">
+              {explain.related_trades.slice(0, 4).map((t, i) => (
+                <li key={i}>
+                  {t.is_exit ? 'Exit' : 'Entry'} {t.side} @ {Number(t.price).toFixed(2)}
+                </li>
               ))}
             </ul>
           </div>
