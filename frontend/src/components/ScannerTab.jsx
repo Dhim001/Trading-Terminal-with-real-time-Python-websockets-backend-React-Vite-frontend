@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Radar, RefreshCw, Search } from 'lucide-react';
+import { Bot, Radar, RefreshCw, Search } from 'lucide-react';
 import { toast } from 'sonner';
 import { useStore } from '../store/useStore';
 import { sendAction, runMarketScan } from '../api/transport';
 import { Action } from '../api/protocol';
+import { pipelineScanDeploy } from '../api/endpoints';
 import { buildOrderDraftFromInsight } from '../lib/insightOrderDraft';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -15,10 +16,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { WidgetEmpty } from './WidgetShell';
+import { WidgetEmpty, DockScrollPanel } from './WidgetShell';
+import {
+  Empty,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+  EmptyDescription,
+  EmptyContent,
+} from '@/components/ui/empty';
 import InsightOrderPreviewDialog from './InsightOrderPreviewDialog';
 import { useVirtualRows, VirtualTablePadding } from './VirtualTableBody';
 import { cn } from '@/lib/utils';
+import { focusAnalyst, openScannerHub } from '../lib/intelligenceEvents';
+import { useSettingsStore } from '../store/useSettingsStore';
+import { normalizeAnalystTimeframe } from '../lib/agentInsights';
 
 function signalClass(signal) {
   if (signal === 'BUY') return 'text-trading-up';
@@ -49,13 +61,19 @@ export default function ScannerTab() {
   const tickerData = useStore((s) => s.tickerData);
   const setBotStrategy = useStore((s) => s.setBotStrategy);
   const openBacktestLab = useStore((s) => s.openBacktestLab);
+  const botConfig = useStore((s) => s.botConfig);
+  const botTimeframe = useStore((s) => s.botTimeframe);
 
   const [loading, setLoading] = useState(false);
+  const [deploying, setDeploying] = useState(false);
   const [search, setSearch] = useState('');
   const [signalFilter, setSignalFilter] = useState('any');
   const [previewDraft, setPreviewDraft] = useState(null);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(false);
+
+  const chartTf = useSettingsStore((s) => s.settings.chartLayout?.timeframe || '1m');
+  const analysisTf = normalizeAnalystTimeframe(chartTf);
 
   const allRows = scanResults?.rows ?? [];
 
@@ -112,6 +130,39 @@ export default function ScannerTab() {
     }
   }, [symbolsList]);
 
+  const deployTopBots = useCallback(async (dryRun = false) => {
+    const symbols = [...new Set((symbolsList || []).filter(Boolean))];
+    if (symbols.length === 0) {
+      toast.error('Watchlist is empty');
+      return;
+    }
+    setDeploying(true);
+    try {
+      const result = await pipelineScanDeploy({
+        symbols,
+        maxDeploy: 3,
+        minConfidence: 0.6,
+        minScore: 2,
+        allocation: botConfig?.allocation ?? 1000,
+        timeframe: botTimeframe || analysisTf,
+        dryRun,
+        config: botConfig,
+      });
+      const n = result?.deployed?.length ?? 0;
+      if (dryRun) {
+        toast.message(`Dry run: would deploy ${n} bot(s) from ${result?.candidates ?? 0} candidates`);
+      } else if (n > 0) {
+        toast.success(`Deployed ${n} CHART_AGENT bot(s) from scan`);
+      } else {
+        toast.message(result?.skipped?.[0]?.reason || 'No symbols met deploy criteria');
+      }
+    } catch (err) {
+      toast.error(err?.message || 'Pipeline deploy failed');
+    } finally {
+      setDeploying(false);
+    }
+  }, [symbolsList, botConfig, botTimeframe, analysisTf]);
+
   useEffect(() => {
     if (!autoRefresh) return undefined;
     const id = setInterval(() => {
@@ -121,11 +172,18 @@ export default function ScannerTab() {
   }, [autoRefresh, runScan]);
 
   const onRowClick = (row) => {
+    if (!agentInsights[row.symbol]) {
+      sendAction(Action.CHART_ANALYZE, { symbol: row.symbol, timeframe: analysisTf });
+    }
+    focusAnalyst({ symbol: row.symbol, expandLatest: true, openHub: false });
+  };
+
+  const onOpenInHub = (row) => {
     setActiveSymbol(row.symbol);
     if (!agentInsights[row.symbol]) {
-      sendAction(Action.CHART_ANALYZE, { symbol: row.symbol });
+      sendAction(Action.CHART_ANALYZE, { symbol: row.symbol, timeframe: analysisTf });
     }
-    window.dispatchEvent(new CustomEvent('dock-tab', { detail: 'analyst' }));
+    focusAnalyst({ symbol: row.symbol, expandLatest: true, openHub: true });
   };
 
   const onPreview = (row) => {
@@ -185,6 +243,26 @@ export default function ScannerTab() {
             Scan watchlist
           </Button>
           <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1 text-xs"
+            disabled={deploying || loading}
+            onClick={() => deployTopBots(false)}
+            title="Deploy up to 3 CHART_AGENT bots for top actionable scan signals"
+          >
+            {deploying ? <RefreshCw className="size-3 animate-spin" /> : <Bot className="size-3" />}
+            Deploy top 3
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={openScannerHub}
+            title="Open full scanner workspace (⌘I)"
+          >
+            Open Hub
+          </Button>
+          <Button
             variant={autoRefresh ? 'secondary' : 'outline'}
             size="sm"
             className="h-7 text-xs"
@@ -218,39 +296,44 @@ export default function ScannerTab() {
 
       {rows.length === 0 ? (
         <div className="dock-panel-tab__empty">
-          <WidgetEmpty
-            icon={Radar}
-            message={
-              allRows.length > 0
-                ? 'No rows match the current filter.'
-                : 'No scan results yet. Run a scan to rank symbols by analyst score.'
-            }
-          />
-          {allRows.length === 0 && (
-            <div className="flex justify-center pb-4">
-              <Button size="sm" className="h-7 text-xs" disabled={loading} onClick={runScan}>
-                Scan watchlist
-              </Button>
-            </div>
-          )}
+          <Empty className="border-none bg-transparent py-6">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Radar />
+              </EmptyMedia>
+              <EmptyTitle>
+                {allRows.length > 0 ? 'No matches' : 'No scan results yet'}
+              </EmptyTitle>
+              <EmptyDescription>
+                {allRows.length > 0
+                  ? 'No rows match the current filter.'
+                  : 'Run a scan to rank watchlist symbols by analyst score.'}
+              </EmptyDescription>
+            </EmptyHeader>
+            {allRows.length === 0 && (
+              <EmptyContent>
+                <Button size="sm" disabled={loading} onClick={runScan}>
+                  Scan watchlist
+                </Button>
+              </EmptyContent>
+            )}
+          </Empty>
         </div>
       ) : (
         <>
-          <div
-            className="dock-panel-tab__table-wrap scroll-panel-y scroll-panel-y-0"
-            onScroll={onScanScroll}
-          >
+          <DockScrollPanel onScroll={onScanScroll}>
             <table className="terminal-table dock-panel-tab__table min-w-[640px] w-full text-xs">
+              <caption className="sr-only">Market scanner ranked by analyst score</caption>
               <thead>
                 <tr>
-                  <th>Symbol</th>
-                  <th>Signal</th>
-                  <th className="text-right">Score</th>
-                  <th className="text-right">Conf.</th>
-                  <th className="text-right">RSI</th>
-                  <th>MACD</th>
-                  <th>ATR</th>
-                  <th />
+                  <th scope="col">Symbol</th>
+                  <th scope="col">Signal</th>
+                  <th scope="col" className="text-right">Score</th>
+                  <th scope="col" className="text-right">Conf.</th>
+                  <th scope="col" className="text-right">RSI</th>
+                  <th scope="col">MACD</th>
+                  <th scope="col">ATR</th>
+                  <th scope="col"><span className="sr-only">Actions</span></th>
                 </tr>
               </thead>
               <tbody>
@@ -282,16 +365,21 @@ export default function ScannerTab() {
                     <td className="text-right whitespace-nowrap">
                       <Button
                         variant="ghost"
-                        size="xs"
-                        className="h-6 text-[0.58rem]"
+                        size="sm"
+                        onClick={(e) => { e.stopPropagation(); onOpenInHub(row); }}
+                      >
+                        Analyst
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={(e) => { e.stopPropagation(); openAlgoForSymbol(row, 'results'); }}
                       >
                         Backtest
                       </Button>
                       <Button
                         variant="ghost"
-                        size="xs"
-                        className="h-6 text-[0.58rem]"
+                        size="sm"
                         onClick={(e) => { e.stopPropagation(); openAlgoForSymbol(row, 'optimizer'); }}
                       >
                         Optimize
@@ -299,11 +387,43 @@ export default function ScannerTab() {
                       {row.signal !== 'NONE' && (
                         <Button
                           variant="ghost"
-                          size="xs"
-                          className="h-6 text-[0.58rem]"
+                          size="sm"
                           onClick={(e) => { e.stopPropagation(); onPreview(row); }}
                         >
                           Preview
+                        </Button>
+                      )}
+                      {row.signal !== 'NONE' && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={deploying}
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            setDeploying(true);
+                            try {
+                              const result = await pipelineScanDeploy({
+                                symbols: [row.symbol],
+                                maxDeploy: 1,
+                                minConfidence: 0.55,
+                                minScore: 2,
+                                allocation: botConfig?.allocation ?? 1000,
+                                timeframe: botTimeframe || analysisTf,
+                                config: botConfig,
+                              });
+                              if (result?.deployed?.length) {
+                                toast.success(`Deployed bot for ${row.symbol}`);
+                              } else {
+                                toast.message(result?.skipped?.[0]?.reason || 'Deploy skipped');
+                              }
+                            } catch (err) {
+                              toast.error(err?.message || 'Deploy failed');
+                            } finally {
+                              setDeploying(false);
+                            }
+                          }}
+                        >
+                          Bot
                         </Button>
                       )}
                     </td>
@@ -312,7 +432,7 @@ export default function ScannerTab() {
                 <VirtualTablePadding height={scanWindow.bottomPad} colSpan={8} />
               </tbody>
             </table>
-          </div>
+          </DockScrollPanel>
 
           <footer className="dock-panel-tab__footer">
             <span>
