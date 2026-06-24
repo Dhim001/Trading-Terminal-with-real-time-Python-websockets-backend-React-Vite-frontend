@@ -26,6 +26,7 @@ from app.config import (
     AGENT_ENABLED,
     SCANNER_ENABLED,
     SIM_SBBS_WARM_ON_STARTUP,
+    LOG_JSON,
 )
 from app.database import init_db
 from app.api.http_server import run_http_server
@@ -47,6 +48,7 @@ from app.services.bots.runtime import (
     bot_market_loop,
     bot_snapshot_loop,
     bot_reconcile_loop,
+    calibration_refresh_loop,
     runs_bar_publisher,
     runs_bot_engine_inline,
 )
@@ -54,6 +56,14 @@ from app.services.archive.runtime import archive_capture_loop, archive_rollup_lo
 from app.services.events import channels, publish as event_publish
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+if LOG_JSON:
+    from app.observability.json_log import JsonFormatter
+
+    _root = logging.getLogger()
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JsonFormatter())
+    _root.handlers = [_handler]
+    _root.setLevel(logging.INFO)
 logging.getLogger("websockets.server").setLevel(logging.WARNING)
 
 if TERMINAL_ROLE == "worker":
@@ -115,17 +125,7 @@ async def simulated_market_loop():
                 await bot_manager.handle_sl_tp_exits(bot_exits)
 
             total_fills = fills + sl_tp_fills
-            slim_data = {}
-            for symbol, md in data.items():
-                slim_data[symbol] = {
-                    "symbol": symbol,
-                    "price": md["price"],
-                    "change_24h": md["change_24h"],
-                    "volume_24h": md["volume_24h"],
-                    "high_24h": md["high_24h"],
-                    "low_24h": md["low_24h"],
-                    "candle": md["candle"],
-                }
+            slim_data = _slim_market_payload(data)
             await publish_market_update(manager.broadcast, slim_data)
 
             for client in list(manager.connected_clients):
@@ -158,6 +158,110 @@ async def simulated_market_loop():
         except Exception as e:
             logging.error("Error in simulated broadcast loop: %s", e)
         await asyncio.sleep(feed.tick_interval)
+
+
+def _slim_market_payload(data: dict) -> dict:
+    """Strip market snapshots for WebSocket market_update (shared shape with sim loop)."""
+    slim: dict = {}
+    for symbol, md in data.items():
+        slim[symbol] = {
+            "symbol": symbol,
+            "price": md["price"],
+            "change_24h": md["change_24h"],
+            "volume_24h": md["volume_24h"],
+            "high_24h": md["high_24h"],
+            "low_24h": md["low_24h"],
+            "candle": md["candle"],
+        }
+    return slim
+
+
+def _market_snapshot_changed(prev: dict | None, cur: dict) -> bool:
+    """True when a slim market_update payload differs from the last broadcast."""
+    if not prev:
+        return True
+    for key in ("price", "change_24h", "volume_24h", "high_24h", "low_24h"):
+        if prev.get(key) != cur.get(key):
+            return True
+    pc, cc = prev.get("candle") or {}, cur.get("candle") or {}
+    if not pc and not cc:
+        return False
+    for key in ("time", "open", "high", "low", "close", "volume"):
+        if pc.get(key) != cc.get(key):
+            return True
+    return False
+
+
+async def live_ib_market_broadcast_loop():
+    """Push in-memory IB feed state to clients on a fixed interval (LIVE_IB only)."""
+    from app.config import IB_BROADCAST_INTERVAL_SEC
+
+    logging.info(
+        "Starting LIVE_IB market broadcast loop (interval=%ss)...",
+        IB_BROADCAST_INTERVAL_SEC,
+    )
+    feed = state.feed
+    manager = state.manager
+    while True:
+        try:
+            data = {symbol: feed.get_market_data(symbol) for symbol in feed.symbols}
+            if data:
+                await publish_market_update(manager.broadcast, _slim_market_payload(data))
+                for client in list(manager.connected_clients):
+                    sym = manager.client_symbols.get(client)
+                    if sym and sym in data and data[sym].get("orderbook"):
+                        await manager.send_to(
+                            client,
+                            orderbook_update({sym: data[sym]["orderbook"]}),
+                        )
+        except Exception as e:
+            logging.error("Error in LIVE_IB market broadcast loop: %s", e)
+        await asyncio.sleep(IB_BROADCAST_INTERVAL_SEC)
+
+
+async def live_massive_market_broadcast_loop():
+    """Push in-memory Massive feed state to clients on a fixed interval (LIVE_MASSIVE only)."""
+    from app.config import MASSIVE_BROADCAST_INTERVAL_SEC, MASSIVE_POLL_INTERVAL_SEC
+
+    logging.info(
+        "Starting LIVE_MASSIVE market broadcast loop (interval=%ss)...",
+        MASSIVE_BROADCAST_INTERVAL_SEC,
+    )
+    feed = state.feed
+    manager = state.manager
+    last_sent: dict[str, dict] = {}
+    while True:
+        interval = MASSIVE_BROADCAST_INTERVAL_SEC
+        try:
+            if hasattr(feed, "massive_status"):
+                status = feed.massive_status
+                if status.get("poll_fallback"):
+                    interval = max(
+                        float(MASSIVE_BROADCAST_INTERVAL_SEC),
+                        float(MASSIVE_POLL_INTERVAL_SEC),
+                    )
+            data = {symbol: feed.get_market_data(symbol) for symbol in feed.symbols}
+            changed: dict[str, dict] = {}
+            if data:
+                for symbol, md in data.items():
+                    slim = _slim_market_payload({symbol: md})[symbol]
+                    if _market_snapshot_changed(last_sent.get(symbol), slim):
+                        changed[symbol] = slim
+                        last_sent[symbol] = slim
+            if changed:
+                await publish_market_update(manager.broadcast, changed)
+                for client in list(manager.connected_clients):
+                    sym = manager.client_symbols.get(client)
+                    if sym and sym in changed:
+                        full = data.get(sym) or {}
+                        if full.get("orderbook"):
+                            await manager.send_to(
+                                client,
+                                orderbook_update({sym: full["orderbook"]}),
+                            )
+        except Exception as e:
+            logging.error("Error in LIVE_MASSIVE market broadcast loop: %s", e)
+        await asyncio.sleep(interval)
 
 
 async def diagnostics_broadcast_loop():
@@ -308,6 +412,7 @@ async def main():
             if not state.bot_engine_uses_bar_hooks:
                 tasks.append(asyncio.create_task(bot_market_loop(state.bot_manager, state.feed)))
             tasks.append(asyncio.create_task(bot_snapshot_loop(state.bot_manager)))
+            tasks.append(asyncio.create_task(calibration_refresh_loop()))
             if TERMINAL_MODE != "SIMULATED":
                 tasks.append(asyncio.create_task(bot_reconcile_loop(state.bot_manager)))
         elif runs_bar_publisher():
@@ -318,6 +423,12 @@ async def main():
             tasks.append(asyncio.create_task(simulated_market_loop()))
             if SIM_SBBS_WARM_ON_STARTUP and hasattr(state.feed, "warm_generators"):
                 tasks.append(asyncio.create_task(state.feed.warm_generators()))
+        elif TERMINAL_MODE == "LIVE_IB":
+            tasks.append(asyncio.create_task(live_ib_market_broadcast_loop()))
+            tasks.append(asyncio.create_task(diagnostics_broadcast_loop()))
+        elif TERMINAL_MODE == "LIVE_MASSIVE":
+            tasks.append(asyncio.create_task(live_massive_market_broadcast_loop()))
+            tasks.append(asyncio.create_task(diagnostics_broadcast_loop()))
         else:
             tasks.append(asyncio.create_task(diagnostics_broadcast_loop()))
 
@@ -336,8 +447,32 @@ async def main():
         await asyncio.gather(*tasks)
 
 
+async def _shutdown() -> None:
+    """Gracefully stop feed (IB disconnect) before process exit."""
+    try:
+        if state.oms is not None and hasattr(state.oms, "stop"):
+            await state.oms.stop()
+    except Exception as exc:
+        logging.debug("OMS shutdown: %s", exc)
+    try:
+        if state.feed is not None and hasattr(state.feed, "stop"):
+            await state.feed.stop()
+    except Exception as exc:
+        logging.debug("Feed shutdown: %s", exc)
+    try:
+        if state.event_bus is not None:
+            await state.event_bus.stop()
+    except Exception as exc:
+        logging.debug("Event bus shutdown: %s", exc)
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        logging.info("Server stopping (graceful shutdown)...")
+        try:
+            asyncio.run(_shutdown())
+        except Exception:
+            pass
         logging.info("Server stopped.")

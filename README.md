@@ -116,6 +116,7 @@ Set `TERMINAL_MODE` in `.env` to switch backends:
 | `LIVE_ALPACA` | Alpaca WebSocket | US equities & ETFs | Paper or live via `ALPACA_BASE_URL` |
 | `LIVE_BINANCE` | Binance streams | Crypto USDT pairs | Requires API keys |
 | `LIVE_ETORO` | REST poll (`/market-data/instruments/rates`) | Equities + crypto | Bearer **or** API-key pair (never both); demo/real env auto-probe |
+| `LIVE_IB` | IB Gateway / TWS (`ib_async`, 1m `keepUpToDate`) | US equities & ETFs | **Feed-only** — orders use simulated OMS; requires Gateway + market data subs |
 
 ---
 
@@ -221,6 +222,39 @@ Server listens on **`ws://127.0.0.1:8765`** and **`http://127.0.0.1:8766`** (RES
 
 On Windows you can also run `backend/start.bat`.
 
+### Dual terminal instances (sim + IB side by side)
+
+Run **simulated** and **IB feed** terminals in parallel without editing repo-root `.env` on each switch. Each instance uses its own ports, SQLite file, and Vite dev server.
+
+| Profile | Launcher | UI | Backend WS / HTTP | SQLite |
+|---------|----------|-----|-------------------|--------|
+| Sim | `.\scripts\start-sim.ps1` | http://127.0.0.1:5173 | 8765 / 8766 | `backend/trading-sim.db` |
+| IB | `.\scripts\start-ib.ps1` | http://127.0.0.1:5174 | 8775 / 8776 | `backend/trading-ib.db` |
+| Massive | `.\scripts\start-massive.ps1` | http://127.0.0.1:5175 | 8785 / 8786 | `backend/trading-massive.db` |
+
+`start-ib.ps1` checks that IB Gateway is reachable on `127.0.0.1:4002` first (edit `env.profiles/ib.env` for your port).
+
+The **Massive** instance streams US equities (`AM`/`T`/`Q` on `/stocks`) and crypto 24/7 (`XA`/`XT`/`XQ` on `/crypto`). Set `MASSIVE_API_KEY` in repo-root `.env`. If your plan excludes WebSocket access, the feed automatically falls back to REST polling (`MASSIVE_POLL_FALLBACK=true`). Execution stays simulated (feed-only).
+
+Backend-only or frontend-only:
+
+```powershell
+.\scripts\start-backend.ps1 -Profile Sim
+.\scripts\start-frontend.ps1 -Profile Ib
+```
+
+Profiles load from `env.profiles/{sim|ib|massive}.env` when `TERMINAL_PROFILE` is set (scripts set this automatically). Repo-root `.env` still loads first for shared secrets; profile keys override.
+
+Manual equivalent:
+
+```powershell
+$env:TERMINAL_PROFILE = "sim"   # or "ib" or "massive"
+cd backend
+python main.py
+```
+
+See `env.profiles/README.md` for customization.
+
 **Full stack with Docker** (Postgres + backend + nginx frontend):
 
 ```bash
@@ -281,7 +315,7 @@ npm run preview
 Create a `.env` file in the **repo root** (loaded by `backend/app/config.py`):
 
 ```env
-# Terminal mode: SIMULATED | LIVE_ALPACA | LIVE_BINANCE | LIVE_ETORO
+# Terminal mode: SIMULATED | LIVE_ALPACA | LIVE_BINANCE | LIVE_ETORO | LIVE_IB
 TERMINAL_MODE=SIMULATED
 
 # Alpaca (LIVE_ALPACA)
@@ -300,6 +334,19 @@ ETORO_USER_KEY=
 ETORO_ENV=auto          # demo | real | auto
 ETORO_POLL_INTERVAL=1.0
 ETORO_EXEC_MIN_INTERVAL=3.0
+
+# Interactive Brokers (LIVE_IB — feed by default; SimulatedOMSService for orders)
+# IB_HOST=127.0.0.1
+# IB_PORT=4002          # paper Gateway; 4001 live
+# IB_CLIENT_ID=7
+# IB_SMOKE_CLIENT_ID=907  # smoke tests / CI (avoid feed client id collision)
+# IB_MARKET_DATA_TYPE=1   # 1=live, 3=delayed
+# IB_PACING_PAUSE_SEC=600
+# IB_AUTO_DELAYED_FALLBACK=true
+# IB_L1_TICKS_ENABLED=true
+# IB_OMS_ENABLED=false    # true = route orders to IB (paper first)
+# IB_OMS_CLIENT_ID=57
+# IB_READ_ONLY_API=false
 
 # Bot engine (optional)
 ALLOW_LIVE_BOTS=false

@@ -51,6 +51,8 @@ import {
 import { sendAction } from './api/transport';
 import { Action } from './api/protocol';
 import { fetchHealth } from './api/endpoints';
+import IbFeedStatusBanner from './components/IbFeedStatusBanner';
+import MassiveFeedStatusBanner from './components/MassiveFeedStatusBanner';
 import { getStoreActions } from './api/dispatch';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
@@ -373,7 +375,7 @@ export default function App() {
               </Badge>
             ) : (
               <Badge variant="secondary" className="header-mode-badge px-2 py-0.5 text-[0.62rem] font-bold tracking-wide" title="Simulated market (no live broker)">
-                SIM
+                {brokerLabel(terminalMode)}
               </Badge>
             )}
           </div>
@@ -566,6 +568,9 @@ export default function App() {
         </div>
       </header>
       </ErrorBoundary>
+
+      {terminalMode === 'LIVE_IB' && <IbFeedStatusBanner />}
+      {terminalMode === 'LIVE_MASSIVE' && <MassiveFeedStatusBanner />}
 
       {!zenMode && modeConfig.showCommandBar && (
         <ErrorBoundary name="Command bar">
