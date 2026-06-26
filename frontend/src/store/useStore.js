@@ -3,12 +3,16 @@ import { subscribeWithSelector } from 'zustand/middleware';
 import { Action } from '../api/protocol';
 import {
   setCandleHistory, applyLiveCandle, hasCandleHistory, mergeCandleHistory,
+  applyLivePrice,
   prependCandleHistory, CHART_SNAPSHOT_BARS, candleBufferKey, chartTimeframeSecs,
-  resolveHistoryTimeframe,
+  resolveHistoryTimeframe, setPinnedCandleSymbol, initCandleBufferCache,
+  onCandleBufferEvict,
 } from '../services/candleBuffer';
+import { isLiveMassiveMode } from '../lib/massiveMarket';
 import {
   hydrateFromSnapshot, scheduleMarketSnapshotSave, forceMarketSnapshotSave,
 } from '../services/marketSnapshot';
+import { emitLivePrice } from '../services/livePriceChannel';
 import { getHmrData } from '../services/hmrState';
 import { agentInsightKey, normalizeAnalystTimeframe } from '../lib/agentInsights';
 import { normalizeBotLogEntry } from '../lib/botLogInsight';
@@ -31,7 +35,7 @@ const setLocal = (key, val) => {
   } catch (_) {}
 };
 
-function bumpRevision(revisions, symbol) {
+export function bumpRevision(revisions, symbol) {
   return { ...revisions, [symbol]: (revisions[symbol] || 0) + 1 };
 }
 
@@ -44,6 +48,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   terminalMode: 'SIMULATED',
   terminalRole: 'all',
   distributed: false,
+  executionMode: 'broker',
   allowLiveBots: false,
   allowCustomStrategies: false,
   archiveParquetEnabled: false,
@@ -145,6 +150,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   setApiStatus: (status) => set({ apiStatus: status }),
 
   setActiveSymbol: (symbol) => {
+    setPinnedCandleSymbol(symbol);
     setLocal('terminal_active_symbol', symbol);
     set({ activeSymbol: symbol });
     import('../api/transport').then(({ sendAction }) => {
@@ -270,8 +276,9 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
 
   setTerminalMode: (mode) => set({ terminalMode: mode, isLive: mode !== 'SIMULATED' }),
 
-  setTerminalConfig: ({ terminalMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge, agentLlmEnabled, agentLlmAvailable, agentLlmProvider, agentLlmModel, agentLlmModels, agentVisionEnabled, agentEnabled, scannerEnabled }) => set((state) => ({
+  setTerminalConfig: ({ terminalMode, executionMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge, agentLlmEnabled, agentLlmAvailable, agentLlmProvider, agentLlmModel, agentLlmModels, agentVisionEnabled, agentEnabled, scannerEnabled }) => set((state) => ({
     terminalMode: terminalMode ?? state.terminalMode,
+    executionMode: executionMode ?? state.executionMode,
     isLive: (terminalMode ?? state.terminalMode) !== 'SIMULATED',
     allowLiveBots: allowLiveBots ?? state.allowLiveBots,
     allowCustomStrategies: allowCustomStrategies ?? state.allowCustomStrategies,
@@ -418,9 +425,15 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     },
   })),
 
-  setTradeExplain: (tradeId, data) => set((state) => ({
-    tradeExplains: { ...state.tradeExplains, [String(tradeId)]: data },
-  })),
+  setTradeExplain: (tradeId, data) => set((state) => {
+    const key = String(tradeId);
+    const next = { ...state.tradeExplains, [key]: data };
+    const keys = Object.keys(next);
+    if (keys.length > 100) {
+      for (const k of keys.slice(0, keys.length - 100)) delete next[k];
+    }
+    return { tradeExplains: next };
+  }),
   setTickData: (data, meta) => set({
     tickData: data && typeof data === 'object' ? { ...data } : {},
     tickMeta: meta ?? null,
@@ -441,6 +454,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     set((state) => {
       const tickerData = state.tickerData;
       const priceDirections = state.priceDirections;
+      const massive = isLiveMassiveMode(state.terminalMode);
       let candleRevision = null;
       let candleHistoryRevision = null;
       let tickerChanged = false;
@@ -503,7 +517,6 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
           }
         }
 
-        // Seed buffer from live tick when history not yet loaded
         if (info.candle && !hasCandleHistory(symbol)) {
           setCandleHistory(symbol, [info.candle]);
           candleRevision = bumpRevision(candleRevision ?? state.candleRevision, symbol);
@@ -511,9 +524,22 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
             candleHistoryRevision ?? state.candleHistoryRevision,
             symbol,
           );
-        } else if (info.candle && hasCandleHistory(symbol)) {
-          if (applyLiveCandle(symbol, info.candle)) {
+        } else if (hasCandleHistory(symbol)) {
+          if (info.candle && applyLiveCandle(symbol, info.candle)) {
             candleRevision = bumpRevision(candleRevision ?? state.candleRevision, symbol);
+          }
+          if (info.price !== undefined) {
+            const priceMoved = prev?.price === undefined || prev.price !== info.price;
+            if (priceMoved) {
+              const keys = applyLivePrice(symbol, info.price);
+              if (massive) {
+                emitLivePrice(symbol, info.price);
+              } else {
+                for (const key of keys) {
+                  candleRevision = bumpRevision(candleRevision ?? state.candleRevision, key);
+                }
+              }
+            }
           }
         }
       }
@@ -525,11 +551,23 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
       if (candleRevision) updates.candleRevision = candleRevision;
       if (candleHistoryRevision) updates.candleHistoryRevision = candleHistoryRevision;
 
+      if (candleRevision || candleHistoryRevision) {
+        scheduleMarketSnapshotSave(get);
+      }
+
       return Object.keys(updates).length ? updates : {};
     });
-    scheduleMarketSnapshotSave(get);
   },
 })));
+
+initCandleBufferCache(getLocal('terminal_active_symbol', 'BTCUSDT'));
+
+onCandleBufferEvict((symbol) => {
+  useStore.setState((state) => ({
+    candleRevision: bumpRevision(state.candleRevision, symbol),
+    candleHistoryRevision: bumpRevision(state.candleHistoryRevision, symbol),
+  }));
+});
 
 if (import.meta.hot) {
   import.meta.hot.dispose((data) => {

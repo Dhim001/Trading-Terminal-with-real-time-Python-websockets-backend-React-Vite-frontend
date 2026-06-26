@@ -13,6 +13,8 @@ from starlette.routing import Route
 from app.api.http.bindings import HTTP_BINDINGS
 from app.api.http.dispatch import http_status_and_body, invoke_action
 from app.api.openapi import build_openapi_spec
+from app.services.bots.execution_mode import execution_mode_label
+
 from app.api.router import ensure_routes_loaded, list_routes
 from app.api.state import AppState
 from app.config import (
@@ -72,6 +74,7 @@ async def health(request: Request) -> JSONResponse:
         "service": "trading-terminal",
         "terminal_mode": TERMINAL_MODE,
         "terminal_role": TERMINAL_ROLE,
+        "execution_mode": execution_mode_label(),
         "ws_clients": len(state.manager.connected_clients),
         "websocket": f"ws://{WS_HOST}:{WS_PORT}",
         "http": f"http://{HTTP_HOST}:{HTTP_PORT}",
@@ -157,6 +160,15 @@ async def health(request: Request) -> JSONResponse:
     if TERMINAL_MODE == "LIVE_MASSIVE" and feed is not None and hasattr(feed, "massive_status"):
         try:
             body["massive"] = feed.massive_status
+            ht_cache = getattr(feed, "_ht_cache", None)
+            if isinstance(ht_cache, dict):
+                body["massive"]["ht_cache_entries"] = len(ht_cache)
+        except Exception:
+            pass
+        try:
+            from app.services.massive_ht_limits import massive_ht_limits_summary
+
+            body["massive_ht_limits"] = massive_ht_limits_summary()
         except Exception:
             pass
 
