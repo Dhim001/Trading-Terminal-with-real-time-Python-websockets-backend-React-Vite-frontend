@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
 import { useStore } from '../store/useStore';
-import { fetchHealth } from '../api/endpoints';
+import { useMassiveHealth } from '../hooks/useMassiveHealth';
+import { massiveFeedPlanLabel } from '../lib/massiveMarket';
 
 /**
  * LIVE_MASSIVE only — explains WS disconnect, REST poll fallback, and partial feeds.
@@ -8,29 +8,13 @@ import { fetchHealth } from '../api/endpoints';
 export default function MassiveFeedStatusBanner() {
   const terminalMode = useStore((s) => s.terminalMode);
   const symbolsList = useStore((s) => s.symbolsList);
-  const [health, setHealth] = useState(null);
+  const health = useMassiveHealth(12_000);
 
-  useEffect(() => {
-    if (terminalMode !== 'LIVE_MASSIVE') return undefined;
-    let cancelled = false;
-    const poll = () => {
-      fetchHealth(null)
-        .then((body) => {
-          if (!cancelled) setHealth(body);
-        })
-        .catch(() => {});
-    };
-    poll();
-    const id = setInterval(poll, 12_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [terminalMode]);
+  if (terminalMode !== 'LIVE_MASSIVE' || !health) return null;
 
-  if (terminalMode !== 'LIVE_MASSIVE' || !health?.massive) return null;
-
-  const m = health.massive;
+  const m = health;
+  const feedPlan = massiveFeedPlanLabel(m);
+  const planSuffix = feedPlan === 'Delayed' ? ' (delayed plan)' : '';
   const stocksLagMin = m.stocks_lag_sec != null ? Math.round(m.stocks_lag_sec / 60) : null;
   const cryptoLagMin = m.crypto_lag_sec != null ? Math.round(m.crypto_lag_sec / 60) : null;
   const symbolCount = symbolsList?.length ?? 26;
@@ -45,10 +29,11 @@ export default function MassiveFeedStatusBanner() {
   if (!wsLive && !inPoll) {
     return (
       <div
-        className="border-b border-trading-down/40 bg-trading-down/10 px-3 py-1.5 text-center text-xs text-trading-down"
+        className="terminal-feed-banner terminal-feed-banner--down"
         role="status"
       >
         Massive feed not connected — check MASSIVE_API_KEY and restart the Massive backend.
+        {feedPlan ? ` Plan: ${feedPlan}.` : ''}
         {lastErr ? ` (${lastErr})` : ''}
       </div>
     );
@@ -57,10 +42,10 @@ export default function MassiveFeedStatusBanner() {
   if (inPoll && !wsLive) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
-        Massive WebSocket unavailable — REST poll fallback active
+        Massive WebSocket unavailable — REST poll fallback active{planSuffix}
         {lastErr ? `: ${lastErr}` : ''}. Prices refresh every ~15s; upgrade plan for live WS.
       </div>
     );
@@ -69,7 +54,7 @@ export default function MassiveFeedStatusBanner() {
   if (inPoll && wsLive) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
         Massive partial — some markets on REST poll
@@ -83,10 +68,10 @@ export default function MassiveFeedStatusBanner() {
   if (stocksLagMin != null && stocksLagMin >= 10) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
-        Massive stocks lag ~{stocksLagMin} min — US equities may be stale (market hours or delayed plan).
+        Massive stocks lag ~{stocksLagMin} min — US equities may be stale{planSuffix}.
       </div>
     );
   }
@@ -94,7 +79,7 @@ export default function MassiveFeedStatusBanner() {
   if (cryptoLagMin != null && cryptoLagMin >= 5) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
         Massive crypto lag ~{cryptoLagMin} min — check WS connection or poll fallback.
@@ -105,7 +90,7 @@ export default function MassiveFeedStatusBanner() {
   if ((m.seeded_symbols ?? 0) < symbolCount && (m.seeded_symbols ?? 0) > 0) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
         Massive seeding history — {m.seeded_symbols}/{symbolCount} symbols ready.
@@ -121,7 +106,7 @@ export default function MassiveFeedStatusBanner() {
     if (cryptoPartial) parts.push('crypto');
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
         Massive feed partial — {parts.join(' + ')} disconnected
@@ -133,7 +118,7 @@ export default function MassiveFeedStatusBanner() {
   if ((m.subscriptions ?? 0) < symbolCount && wsLive) {
     return (
       <div
-        className="border-b border-trading-warn/30 bg-trading-warn/10 px-3 py-1.5 text-center text-xs text-trading-warn"
+        className="terminal-feed-banner terminal-feed-banner--warn"
         role="status"
       >
         Massive subscriptions warming up — {m.subscriptions ?? 0} channels for {symbolCount} symbols.

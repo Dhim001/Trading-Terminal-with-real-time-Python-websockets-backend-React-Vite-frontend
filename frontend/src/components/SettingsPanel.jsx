@@ -58,6 +58,12 @@ import {
 import { themeChartDefaults, getEffectiveSettings } from '../settings/themePresets';
 import { getIndicatorTheme, getIndicatorToolbarMeta } from '../settings/indicatorThemes';
 import { DEFAULT_TERMINAL_SETTINGS } from '../settings/defaults';
+import { normalizeWatchlistColumns } from '../settings/watchlistColumns';
+import {
+  BUILTIN_WATCHLIST_COLUMN_PRESETS,
+  buildCustomWatchlistPreset,
+  resolveWatchlistColumnPresetId,
+} from '../settings/watchlistColumnPresets';
 import { fetchHealth, parseMetricsSummary, fetchLlmModels } from '../api/endpoints';
 import LlmSettingsSection from './LlmSettingsSection';
 import {
@@ -117,6 +123,63 @@ function ColorField({ id, label, value, onChange, presets = [], onCustomize }) {
               title={c}
               aria-label={`Use ${c}`}
             />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function WatchlistPresetSaveRow({ settings, updateSettings, updateWorkspace }) {
+  const [name, setName] = useState('');
+
+  const savePreset = () => {
+    const preset = buildCustomWatchlistPreset(name, settings.workspace?.watchlistColumns);
+    const next = [preset, ...(settings.watchlistColumnPresets ?? [])].slice(0, 8);
+    updateSettings({ watchlistColumnPresets: next });
+    updateWorkspace({ watchlistColumnPresetId: preset.id });
+    setName('');
+    toast.success(`Saved column preset “${preset.name}”`);
+  };
+
+  const deleteCustom = (id) => {
+    updateSettings({
+      watchlistColumnPresets: (settings.watchlistColumnPresets ?? []).filter((p) => p.id !== id),
+    });
+    if (settings.workspace?.watchlistColumnPresetId === id) {
+      updateWorkspace({ watchlistColumnPresetId: 'custom' });
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2 border-t border-border pt-3">
+      <Label className="text-xs text-muted-foreground">Save current layout</Label>
+      <div className="flex gap-2">
+        <Input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Preset name…"
+          className="h-8 flex-1 text-xs"
+        />
+        <Button type="button" variant="outline" size="sm" className="text-xs" onClick={savePreset}>
+          Save
+        </Button>
+      </div>
+      {(settings.watchlistColumnPresets ?? []).length > 0 && (
+        <div className="flex flex-col gap-1">
+          {(settings.watchlistColumnPresets ?? []).map((p) => (
+            <div key={p.id} className="flex items-center justify-between gap-2">
+              <span className="text-xs text-muted-foreground">{p.name}</span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-6 px-2 text-[0.65rem] text-destructive"
+                onClick={() => deleteCustom(p.id)}
+              >
+                Remove
+              </Button>
+            </div>
           ))}
         </div>
       )}
@@ -897,6 +960,95 @@ export default function SettingsPanel({ open, onOpenChange, onOpenAdmin }) {
                 </ToggleGroup>
               </SettingsAccordionSection>
 
+              <SettingsAccordionSection
+                value="watchlist-columns"
+                title="Watchlist columns"
+                hint="Presets, optional columns, and asset-class sections on the All tab."
+              >
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs text-muted-foreground">Column presets</Label>
+                    <div className="flex flex-wrap gap-1">
+                      {[...BUILTIN_WATCHLIST_COLUMN_PRESETS, ...(settings.watchlistColumnPresets ?? [])].map((preset) => (
+                        <Button
+                          key={preset.id}
+                          type="button"
+                          variant={
+                            (settings.workspace?.watchlistColumnPresetId
+                              ?? resolveWatchlistColumnPresetId(settings.workspace?.watchlistColumns, settings.watchlistColumnPresets))
+                            === preset.id
+                              ? 'secondary'
+                              : 'outline'
+                          }
+                          size="sm"
+                          className="h-7 text-xs"
+                          title={preset.description}
+                          onClick={() => updateWorkspace({
+                            watchlistColumns: normalizeWatchlistColumns(preset.columns),
+                            watchlistColumnPresetId: preset.id,
+                          })}
+                        >
+                          {preset.name}
+                        </Button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="settings-wl-sections"
+                      checked={settings.workspace?.watchlistSections !== false}
+                      onCheckedChange={(v) => updateWorkspace({ watchlistSections: v === true })}
+                    />
+                    <Label htmlFor="settings-wl-sections" className="text-xs font-normal">
+                      Group by asset class on All tab
+                    </Label>
+                  </div>
+
+                  <div className="flex flex-col gap-2">
+                    {[
+                      ['change_abs', 'Change ($)'],
+                      ['change_24h', 'Change (%)'],
+                      ['volume_24h', 'Volume (24h)'],
+                      ['avg_volume', 'Avg 1m volume'],
+                    ].map(([key, label]) => {
+                      const cols = settings.workspace?.watchlistColumns ?? {};
+                      const checked = cols[key] !== false;
+                      return (
+                        <div key={key} className="flex items-center gap-2">
+                          <Checkbox
+                            id={`settings-wl-${key}`}
+                            checked={checked}
+                            onCheckedChange={(v) => {
+                              const next = normalizeWatchlistColumns({
+                                ...(settings.workspace?.watchlistColumns || {}),
+                                [key]: v === true,
+                              });
+                              updateWorkspace({
+                                watchlistColumns: next,
+                                watchlistColumnPresetId: resolveWatchlistColumnPresetId(
+                                  next,
+                                  settings.watchlistColumnPresets,
+                                ),
+                              });
+                            }}
+                          />
+                          <Label htmlFor={`settings-wl-${key}`} className="text-xs font-normal">
+                            {label}
+                          </Label>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <WatchlistPresetSaveRow
+                    settings={settings}
+                    updateSettings={updateSettings}
+                    updateWorkspace={updateWorkspace}
+                  />
+                </div>
+              </SettingsAccordionSection>
+
               <SettingsAccordionSection value="onboarding" title="Onboarding">
                 <Button
                   variant="outline"
@@ -999,6 +1151,7 @@ export default function SettingsPanel({ open, onOpenChange, onOpenAdmin }) {
                   {obsHealth?.massive && (
                     <>
                       <div><dt>Massive WS</dt><dd>{obsHealth.massive.connected ? 'yes' : 'no'}</dd></div>
+                      <div><dt>Feed plan</dt><dd>{obsHealth.massive.feed_plan ?? '—'}</dd></div>
                       <div><dt>Stocks mode</dt><dd>{obsHealth.massive.stocks_mode ?? '—'}</dd></div>
                       <div><dt>Crypto mode</dt><dd>{obsHealth.massive.crypto_mode ?? '—'}</dd></div>
                       <div><dt>NBBO quotes</dt><dd>{obsHealth.massive.real_quote_symbols ?? 0} symbols</dd></div>
@@ -1022,6 +1175,15 @@ export default function SettingsPanel({ open, onOpenChange, onOpenAdmin }) {
                       )}
                       {obsHealth.massive.crypto_lag_sec != null && (
                         <div><dt>Crypto lag</dt><dd>{obsHealth.massive.crypto_lag_sec}s</dd></div>
+                      )}
+                      {obsHealth.massive.ht_cache_entries != null && (
+                        <div>
+                          <dt>HT cache</dt>
+                          <dd>
+                            {obsHealth.massive.ht_cache_entries}
+                            /{obsHealth.massive.ht_cache_max_entries ?? '—'}
+                          </dd>
+                        </div>
                       )}
                     </>
                   )}
@@ -1166,6 +1328,8 @@ export default function SettingsPanel({ open, onOpenChange, onOpenAdmin }) {
                         <div><dt>Massive trades</dt><dd>{obsMetrics.massive_trades_received_total ?? obsHealth?.observability?.massive_trades_received_total ?? 0}</dd></div>
                         <div><dt>Massive quotes</dt><dd>{obsMetrics.massive_quotes_received_total ?? obsHealth?.observability?.massive_quotes_received_total ?? 0}</dd></div>
                         <div><dt>Massive poll updates</dt><dd>{obsMetrics.massive_poll_updates_total ?? obsHealth?.observability?.massive_poll_updates_total ?? 0}</dd></div>
+                        <div><dt>HT cache hits</dt><dd>{obsMetrics.massive_ht_cache_hit_total ?? 0}</dd></div>
+                        <div><dt>HT cache misses</dt><dd>{obsMetrics.massive_ht_cache_miss_total ?? 0}</dd></div>
                       </>
                     )}
                   </dl>

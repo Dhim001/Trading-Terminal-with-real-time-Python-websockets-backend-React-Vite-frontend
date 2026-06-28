@@ -202,6 +202,9 @@ def init_db():
     _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN take_profit_percent REAL DEFAULT NULL")
     _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN stop_loss_price REAL DEFAULT NULL")
     _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN take_profit_price REAL DEFAULT NULL")
+    _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN high_watermark REAL DEFAULT NULL")
+    _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN low_watermark REAL DEFAULT NULL")
+    _safe_alter(cursor, "ALTER TABLE bot_positions ADD COLUMN entry_atr REAL DEFAULT NULL")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS bot_pending_fills (
             id TEXT PRIMARY KEY,
@@ -324,6 +327,34 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_agent_insights_symbol_time "
         "ON agent_insights (symbol, bar_time DESC)"
     )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vision_reports (
+            report_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            timeframe TEXT NOT NULL,
+            bar_time INTEGER NOT NULL,
+            payload TEXT NOT NULL,
+            rag_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vision_reports_symbol_time "
+        "ON vision_reports (symbol, bar_time DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_vision_reports_symbol_tf_time "
+        "ON vision_reports (symbol, timeframe, bar_time DESC)"
+    )
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chart_drawings (
+            symbol TEXT PRIMARY KEY,
+            drawings_json TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    """)
 
     from app.services.archive.schema import init_archive_schema
     init_archive_schema(cursor)
