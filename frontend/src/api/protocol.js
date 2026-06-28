@@ -16,12 +16,15 @@ export const Action = Object.freeze({
   ADMIN_SEED_BALANCE: 'admin_seed_balance',
   ADMIN_RESET_SYSTEM: 'admin_reset_system',
   ADMIN_EMERGENCY_STOP: 'admin_emergency_stop',
+  ADMIN_RESET_RISK_KILL_SWITCH: 'admin_reset_risk_kill_switch',
   ADMIN_GET_STATS: 'admin_get_stats',
   ADMIN_ARCHIVE_BACKFILL: 'admin_archive_backfill',
   ADMIN_ARCHIVE_EXPORT: 'admin_archive_export',
   ADMIN_GET_RECONCILIATION: 'admin_get_reconciliation',
   ADMIN_RECONCILE: 'admin_reconcile',
   ADMIN_RESOLVE_AMBIGUOUS: 'admin_resolve_ambiguous',
+  ADMIN_GET_SAFE_MODE: 'admin_get_safe_mode',
+  ADMIN_CONFIRM_SAFE_MODE: 'admin_confirm_safe_mode',
   GET_MARKET_TICKS: 'get_market_ticks',
   BOT_CREATE: 'bot_create',
   BOT_STOP: 'bot_stop',
@@ -42,6 +45,10 @@ export const Action = Object.freeze({
   CHART_VISION: 'chart_vision',
   CHART_DRAWINGS_GET: 'chart_drawings_get',
   CHART_DRAWINGS_SET: 'chart_drawings_set',
+  ANALYTICS_GET: 'analytics_get',
+  JOURNAL_LIST: 'journal_list',
+  JOURNAL_UPSERT: 'journal_upsert',
+  JOURNAL_DELETE: 'journal_delete',
 });
 
 /** Server → client message types */
@@ -69,6 +76,10 @@ export const MessageType = Object.freeze({
   SCAN_RESULTS: 'scan_results',
   VISION_REPORT: 'vision_report',
   CHART_DRAWINGS: 'chart_drawings',
+  ANALYTICS_REPORT: 'analytics_report',
+  JOURNAL_ENTRIES: 'journal_entries',
+  JOURNAL_ENTRY: 'journal_entry',
+  JOURNAL_DELETED: 'journal_deleted',
   ERROR: 'error',
 });
 

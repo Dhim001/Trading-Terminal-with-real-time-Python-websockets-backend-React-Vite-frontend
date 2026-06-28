@@ -109,6 +109,15 @@ export const HTTP_ROUTES = Object.freeze({
     path: () => '/api/v1/admin/reconciliation/resolve',
     body: (p) => p,
   },
+  [Action.ADMIN_GET_SAFE_MODE]: {
+    method: 'GET',
+    path: () => '/api/v1/admin/safe-mode',
+  },
+  [Action.ADMIN_CONFIRM_SAFE_MODE]: {
+    method: 'POST',
+    path: () => '/api/v1/admin/safe-mode/confirm',
+    body: (p) => p,
+  },
   [Action.GET_MARKET_TICKS]: {
     method: 'GET',
     path: (p) => {
@@ -131,20 +140,48 @@ export const HTTP_ROUTES = Object.freeze({
   },
   [Action.ADMIN_RESET_SYSTEM]: { method: 'POST', path: () => '/api/v1/admin/reset' },
   [Action.ADMIN_EMERGENCY_STOP]: { method: 'POST', path: () => '/api/v1/admin/emergency-stop' },
+  [Action.ADMIN_RESET_RISK_KILL_SWITCH]: { method: 'POST', path: () => '/api/v1/admin/risk/reset-kill-switch' },
   [Action.CHART_ANALYZE]: { method: 'POST', path: () => '/api/v1/agent/analyze', body: (p) => p },
   [Action.CHART_DEEP_REASON]: { method: 'POST', path: () => '/api/v1/agent/deep-reason', body: (p) => p },
   [Action.EXPLAIN_TRADE]: { method: 'POST', path: () => '/api/v1/agent/explain-trade', body: (p) => p },
   [Action.MARKET_SCAN]: { method: 'POST', path: () => '/api/v1/scanner/scan', body: (p) => p },
   [Action.CHART_VISION]: { method: 'POST', path: () => '/api/v1/agent/vision', body: (p) => p },
+  [Action.ANALYTICS_GET]: { method: 'POST', path: () => '/api/v1/analytics', body: (p) => p },
+  [Action.JOURNAL_LIST]: {
+    method: 'GET',
+    path: (p) => {
+      const qs = new URLSearchParams();
+      if (p.query) qs.set('query', String(p.query));
+      if (p.tag) qs.set('tag', String(p.tag));
+      if (p.symbol) qs.set('symbol', String(p.symbol));
+      if (p.limit != null) qs.set('limit', String(p.limit));
+      const q = qs.toString();
+      return `/api/v1/journal${q ? `?${q}` : ''}`;
+    },
+  },
+  [Action.JOURNAL_UPSERT]: { method: 'POST', path: () => '/api/v1/journal', body: (p) => p },
+  [Action.JOURNAL_DELETE]: {
+    method: 'DELETE',
+    path: (p) => `/api/v1/journal/${encodeURIComponent(p.id)}`,
+  },
+  [Action.CHART_DRAWINGS_GET]: {
+    method: 'GET',
+    path: (p) => `/api/v1/chart-drawings/${encodeURIComponent(p.symbol)}`,
+  },
+  [Action.CHART_DRAWINGS_SET]: {
+    method: 'POST',
+    path: (p) => `/api/v1/chart-drawings/${encodeURIComponent(p.symbol)}`,
+    body: (p) => ({ drawings: p.drawings }),
+  },
 });
 
-export async function invokeHttpAction(action, payload = {}) {
+export async function invokeHttpAction(action, payload = {}, extraOptions = {}) {
   const route = HTTP_ROUTES[action];
   if (!route) {
     throw new Error(`No HTTP route for action: ${action}`);
   }
 
-  const options = { method: route.method };
+  const options = { method: route.method, ...extraOptions };
   if (route.body) {
     const body = route.body(payload);
     if (body != null && Object.keys(body).length > 0) {
