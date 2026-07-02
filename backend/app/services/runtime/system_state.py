@@ -7,13 +7,14 @@ import time
 from typing import Any
 
 from app.config import TERMINAL_ROLE
-from app.db.connection import get_connection
+from app.db.connection import db_session
 
 KEY_SHUTDOWN_CLEAN = "shutdown_clean"
 KEY_UNCLEAN_BOOT = "unclean_boot_detected"
 KEY_SAFE_MODE_ACTIVE = "safe_mode_active"
 KEY_SAFE_MODE_REASON = "safe_mode_reason"
 KEY_BOT_RUNTIME_CHECKPOINT = "bot_runtime_checkpoint"
+KEY_NOTIFICATION_LAST_DIGEST_DATE = "notification_last_digest_date"
 
 
 def _process_role() -> str:
@@ -29,22 +30,18 @@ def _now() -> float:
 
 
 def _get_text(key: str) -> str | None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
+    with db_session(commit=False) as conn:
+        cursor = conn.cursor()
         cursor.execute("SELECT value FROM system_runtime WHERE key = ?", (key,))
         row = cursor.fetchone()
         if not row:
             return None
         return row["value"] if isinstance(row, dict) else row[0]
-    finally:
-        conn.close()
 
 
 def _set_text(key: str, value: str) -> None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
+    with db_session() as conn:
+        cursor = conn.cursor()
         cursor.execute(
             """
             INSERT INTO system_runtime (key, value, updated_at)
@@ -55,19 +52,12 @@ def _set_text(key: str, value: str) -> None:
             """,
             (key, value, _now()),
         )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _delete_key(key: str) -> None:
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
+    with db_session() as conn:
+        cursor = conn.cursor()
         cursor.execute("DELETE FROM system_runtime WHERE key = ?", (key,))
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def mark_process_starting() -> bool:
@@ -137,6 +127,15 @@ def load_bot_runtime_checkpoint() -> dict[str, Any]:
 
 def clear_bot_runtime_checkpoint() -> None:
     _delete_key(KEY_BOT_RUNTIME_CHECKPOINT)
+
+
+def get_last_digest_date() -> str | None:
+    """ISO date (YYYY-MM-DD) of the last scheduled daily digest send."""
+    return _get_text(KEY_NOTIFICATION_LAST_DIGEST_DATE)
+
+
+def set_last_digest_date(iso_date: str) -> None:
+    _set_text(KEY_NOTIFICATION_LAST_DIGEST_DATE, iso_date)
 
 
 def runtime_status_dict() -> dict[str, Any]:

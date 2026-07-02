@@ -20,6 +20,7 @@ import ChartContextStrip     from './components/ChartContextStrip';
 import { useAlertMonitor } from './hooks/useAlertMonitor';
 import { applyLayoutMode } from './settings/layoutModes';
 import MemoryDevBadge from './components/MemoryDevBadge';
+import PwaInstallBanner from './components/PwaInstallBanner';
 
 const ChartWidget = lazy(() => import('./components/ChartWidget'));
 const MultiChartGrid = lazy(() => import('./components/MultiChartGrid'));
@@ -48,7 +49,7 @@ import { cn } from '@/lib/utils';
 import { brokerLabel } from '@/lib/operator';
 import {
   TrendingUp, LayoutGrid, BarChart2, SlidersHorizontal, Search, OctagonX,
-  CircleHelp, Bell,
+  CircleHelp, Bell, Activity,
 } from 'lucide-react';
 import { sendAction } from './api/transport';
 import { Action } from './api/protocol';
@@ -56,6 +57,7 @@ import { fetchHealth } from './api/endpoints';
 import IbFeedStatusBanner from './components/IbFeedStatusBanner';
 import MassiveFeedStatusBanner from './components/MassiveFeedStatusBanner';
 import { getStoreActions } from './api/dispatch';
+import { openBacktestLabResults } from './lib/backtestLab';
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -116,11 +118,7 @@ export default function App() {
   const handleSidebarLayout = useCallback(({ width, collapsed }) => {
     setSidebarWidth((prev) => (prev === width ? prev : width));
     setSidebarCollapsed((prev) => (prev === collapsed ? prev : !!collapsed));
-    const stored = useSettingsStore.getState().settings.workspace?.sidebarWidth;
-    if (stored !== width) {
-      updateWorkspace({ sidebarWidth: width });
-    }
-  }, [updateWorkspace]);
+  }, []);
 
   const handleLayoutModeChange = useCallback((mode) => {
     const cfg = applyLayoutMode(mode);
@@ -457,6 +455,22 @@ export default function App() {
                 <Button
                   variant="ghost"
                   size="icon-sm"
+                  onClick={() => openBacktestLabResults()}
+                  className="header-icon-btn text-muted-foreground hover:text-trading-accent"
+                  title="Backtest Lab — Results, Optimizer, Jobs"
+                >
+                  <Activity aria-hidden />
+                  <span className="sr-only">Backtest Lab</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Backtest Lab</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
                   onClick={() => setActivityOpen(true)}
                   className="header-icon-btn text-muted-foreground hover:text-trading-accent"
                   title="Activity center"
@@ -630,6 +644,7 @@ export default function App() {
         </ErrorBoundary>
       )}
       <MemoryDevBadge />
+      <PwaInstallBanner />
     </div>
   );
 }

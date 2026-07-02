@@ -173,6 +173,63 @@ ARCHIVE_TICKS_ENABLED = os.environ.get("ARCHIVE_TICKS_ENABLED", "false").lower()
 )
 ARCHIVE_TICK_RETENTION_HOURS = int(os.environ.get("ARCHIVE_TICK_RETENTION_HOURS", "24"))
 ARCHIVE_TICK_FLUSH_INTERVAL = float(os.environ.get("ARCHIVE_TICK_FLUSH_INTERVAL", "30"))
+ARCHIVE_TICK_BATCH_MAX = int(os.environ.get("ARCHIVE_TICK_BATCH_MAX", "5000"))
+
+# Data quality monitoring (stale feeds, candle gaps, abnormal spreads)
+DATA_QUALITY_ENABLED = os.environ.get("DATA_QUALITY_ENABLED", "true").lower() in (
+    "1", "true", "yes"
+)
+DATA_QUALITY_INTERVAL_SEC = float(os.environ.get("DATA_QUALITY_INTERVAL_SEC", "15"))
+DATA_QUALITY_STALE_WARN_SEC = float(os.environ.get("DATA_QUALITY_STALE_WARN_SEC", "30"))
+DATA_QUALITY_STALE_PAUSE_SEC = float(os.environ.get("DATA_QUALITY_STALE_PAUSE_SEC", "60"))
+DATA_QUALITY_MAX_SPREAD_PCT = float(os.environ.get("DATA_QUALITY_MAX_SPREAD_PCT", "2.0"))
+DATA_QUALITY_GAP_BAR_SEC = int(os.environ.get("DATA_QUALITY_GAP_BAR_SEC", "120"))
+DATA_QUALITY_ACTIVE_PAUSE = os.environ.get("DATA_QUALITY_ACTIVE_PAUSE", "true").lower() in (
+    "1", "true", "yes"
+)
+
+# Alternative data refresh (Massive/Polygon REST)
+ALTDATA_ENABLED = os.environ.get("ALTDATA_ENABLED", "true").lower() in ("1", "true", "yes")
+ALTDATA_REFRESH_INTERVAL_SEC = float(os.environ.get("ALTDATA_REFRESH_INTERVAL_SEC", "3600"))
+
+# News/social sentiment feed (lexicon-scored headlines → sentiment_events)
+SENTIMENT_ENABLED = os.environ.get("SENTIMENT_ENABLED", "true").lower() in ("1", "true", "yes")
+SENTIMENT_LOOKBACK_HOURS = float(os.environ.get("SENTIMENT_LOOKBACK_HOURS", "24"))
+SENTIMENT_SCORE_THRESHOLD = float(os.environ.get("SENTIMENT_SCORE_THRESHOLD", "0.2"))
+
+# Finnhub.io — company news + news-sentiment (https://finnhub.io/docs/api)
+FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+FINNHUB_API_URL = os.environ.get("FINNHUB_API_URL", "https://finnhub.io/api/v1").strip().rstrip("/")
+
+# Strategy advisor — LLM-suggested bot params with optional shadow backtest
+STRATEGY_ADVISOR_ENABLED = os.environ.get("STRATEGY_ADVISOR_ENABLED", "true").lower() in ("1", "true", "yes")
+STRATEGY_ADVISOR_DEFAULT_DAYS = int(os.environ.get("STRATEGY_ADVISOR_DEFAULT_DAYS", "30"))
+
+# External notifications (webhooks, Telegram, email digest)
+NOTIFICATIONS_ENABLED = os.environ.get("NOTIFICATIONS_ENABLED", "true").lower() in (
+    "1", "true", "yes"
+)
+# Master key for encrypting per-channel secrets in DB (generate a long random string)
+NOTIFICATION_ENCRYPTION_KEY = os.environ.get("NOTIFICATION_ENCRYPTION_KEY", "").strip()
+NOTIFICATION_DEDUPE_WINDOW_SEC = float(os.environ.get("NOTIFICATION_DEDUPE_WINDOW_SEC", "60"))
+NOTIFICATION_DELIVERY_MAX_RETRIES = int(os.environ.get("NOTIFICATION_DELIVERY_MAX_RETRIES", "3"))
+NOTIFICATION_DIGEST_ENABLED = os.environ.get("NOTIFICATION_DIGEST_ENABLED", "true").lower() in (
+    "1", "true", "yes"
+)
+NOTIFICATION_DIGEST_HOUR = int(os.environ.get("NOTIFICATION_DIGEST_HOUR", "18"))
+NOTIFICATION_DIGEST_TZ = os.environ.get(
+    "NOTIFICATION_DIGEST_TZ",
+    os.environ.get("RISK_EQUITY_MARKET_TZ", "America/New_York"),
+)
+ALERT_RULES_ENABLED = os.environ.get("ALERT_RULES_ENABLED", "true").lower() in (
+    "1", "true", "yes"
+)
+WEB_PUSH_ENABLED = os.environ.get("WEB_PUSH_ENABLED", "true").lower() in (
+    "1", "true", "yes"
+)
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:admin@localhost").strip()
 
 if ARCHIVE_BACKEND not in ("db", "parquet", "both", ""):
     import logging as _logging

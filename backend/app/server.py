@@ -21,6 +21,8 @@ from app.config import (
     ARCHIVE_TICKS_ENABLED,
     ARCHIVE_PARQUET_ENABLED,
     ARCHIVE_BACKEND,
+    DATA_QUALITY_ENABLED,
+    ALTDATA_ENABLED,
     AGENT_LLM_ENABLED,
     AGENT_VISION_ENABLED,
     AGENT_ENABLED,
@@ -269,11 +271,16 @@ async def live_massive_market_broadcast_loop():
 
 async def diagnostics_broadcast_loop():
     manager = state.manager
+    feed = state.feed
     while True:
         try:
             from app.database import get_db_stats
+            from app.services.data_quality.monitor import evaluate_symbols, data_quality_stats_from_report
 
             stats = await asyncio.to_thread(get_db_stats)
+            symbols = list(getattr(feed, "symbols", []) or [])
+            if symbols and not stats.get("data_quality"):
+                stats["data_quality"] = data_quality_stats_from_report(evaluate_symbols(symbols))
             stats["clients"] = len(manager.connected_clients)
             stats["tick_interval"] = 1.0
             stats["volatility_multiplier"] = 1.0
@@ -361,7 +368,13 @@ async def heartbeat_loop():
 
 
 async def main():
+    from app.db.connection import warm_pool
+
+    warm_pool()
     init_db()
+    from app.db.migrations import run_alembic_upgrade_if_enabled
+
+    run_alembic_upgrade_if_enabled()
     system_state.mark_process_starting()
     try:
         from app.config import BACKTEST_JOB_RETENTION_DAYS, OPTIMIZATION_RETENTION_DAYS
@@ -409,6 +422,7 @@ async def main():
 
     shutdown_event = asyncio.Event()
     install_signal_handlers(asyncio.get_running_loop(), shutdown_event)
+    state.shutdown_event = shutdown_event
 
     logging.info("Starting server (role=%s, ws=%s:%s, http=%s:%s)...", TERMINAL_ROLE, WS_HOST, WS_PORT, HTTP_HOST, HTTP_PORT)
 
@@ -423,7 +437,16 @@ async def main():
             tasks = [asyncio.create_task(heartbeat_loop())]
 
             if HTTP_ENABLED:
-                start_http_server(state, shutdown_event)
+                http_task = start_http_server(state, shutdown_event)
+
+                def _log_http_task_exit(task: asyncio.Task) -> None:
+                    if task.cancelled():
+                        return
+                    exc = task.exception()
+                    if exc is not None:
+                        logging.critical("HTTP server task exited unexpectedly: %s", exc)
+
+                http_task.add_done_callback(_log_http_task_exit)
 
             if runs_bot_engine_inline():
                 if not state.bot_engine_uses_bar_hooks:
@@ -458,6 +481,21 @@ async def main():
             if ARCHIVE_TICKS_ENABLED:
                 from app.services.archive.tick_writer import tick_flush_loop
                 tasks.append(asyncio.create_task(tick_flush_loop()))
+
+            if DATA_QUALITY_ENABLED:
+                from app.services.data_quality.loop import data_quality_loop
+                tasks.append(asyncio.create_task(
+                    data_quality_loop(state.bot_manager, state.feed)
+                ))
+
+            if ALTDATA_ENABLED:
+                from app.services.altdata.loop import altdata_refresh_loop
+                tasks.append(asyncio.create_task(altdata_refresh_loop(state.feed)))
+
+            from app.config import NOTIFICATION_DIGEST_ENABLED
+            if NOTIFICATION_DIGEST_ENABLED:
+                from app.services.notifications.digest_loop import notification_digest_loop
+                tasks.append(asyncio.create_task(notification_digest_loop(state.oms)))
 
             from app.services.bots.backtest_worker import backtest_job_worker_loop
             tasks.append(asyncio.create_task(backtest_job_worker_loop(state)))

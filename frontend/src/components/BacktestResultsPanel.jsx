@@ -4,16 +4,19 @@
 import React, { useMemo, useCallback, useState, useEffect, useRef } from 'react';
 import { toast } from 'sonner';
 import { Download, Maximize2, AlertTriangle, LineChart, Loader2, FileText, Sparkles } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { openBacktestLabResults } from '../lib/backtestLab';
+import { useStore } from '../store/useStore';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { StatCard } from '@/components/StatCard';
 import BacktestMiniChart from './BacktestMiniChart';
+import BacktestPriceChart from './BacktestPriceChart';
 import BacktestComparePanel from './BacktestComparePanel';
+import StrategySuggestPanel from './StrategySuggestPanel';
 import BacktestParityPanel from './BacktestParityPanel';
 import BacktestReasoningPanel from './BacktestReasoningPanel';
-import { useStore } from '../store/useStore';
+import { cn } from '@/lib/utils';
 import { fetchBacktestTrades, fetchBacktestRun } from '../api/endpoints';
 import { useVirtualRows, VirtualTablePadding } from './VirtualTableBody';
 import {
@@ -291,14 +294,15 @@ export default function BacktestResultsPanel({
   oosPct = null,
   reasoningPending = false,
   showReasoningSection = false,
+  advisorBotId = null,
+  agentLlmAvailable = false,
 }) {
-  const setBacktestLabOpen = useStore((s) => s.setBacktestLabOpen);
-  const setBacktestLabTab = useStore((s) => s.setBacktestLabTab);
   const setBacktestResults = useStore((s) => s.setBacktestResults);
   const setBacktestOverlay = useStore((s) => s.setBacktestOverlay);
   const setActiveSymbol = useStore((s) => s.setActiveSymbol);
   const backtestOverlay = useStore((s) => s.backtestOverlay);
   const botConfig = useStore((s) => s.botConfig);
+  const activeBots = useStore((s) => s.activeBots);
   const activeSymbol = useStore((s) => s.activeSymbol);
   const botStrategy = useStore((s) => s.botStrategy);
   const botTimeframe = useStore((s) => s.botTimeframe);
@@ -462,9 +466,18 @@ export default function BacktestResultsPanel({
     );
   }, [displayTrades, results, symbol, strategy]);
 
-  const onExportPdf = useCallback(() => {
-    const exportTrades = fullTrades ?? previewTrades;
-    const outcome = exportBacktestPdf({
+  const onExportPdf = useCallback(async () => {
+    let exportTrades = fullTrades ?? previewTrades;
+    if (results?.run_id && (results.trades_total ?? 0) > exportTrades.length) {
+      try {
+        exportTrades = await fetchBacktestTrades(results.run_id);
+      } catch {
+        /* use preview trades */
+      }
+    }
+
+    const toastId = toast.loading('Preparing PDF with chart…');
+    const outcome = await exportBacktestPdf({
       results,
       symbol: symbol ?? results?.meta?.symbol,
       strategy: strategy ?? results?.meta?.strategy,
@@ -472,11 +485,13 @@ export default function BacktestResultsPanel({
       timeframe: backtestTimeframe ?? results?.meta?.timeframe,
       trades: exportTrades,
     });
+    toast.dismiss(toastId);
+
     if (!outcome?.ok) {
-      toast.error(outcome?.error || 'Could not open PDF export');
+      toast.error(outcome?.error || 'Could not download PDF');
       return;
     }
-    toast.message('Print dialog opened — choose Save as PDF');
+    toast.success(outcome.filename ? `Downloaded ${outcome.filename}` : 'PDF downloaded');
   }, [fullTrades, previewTrades, results, symbol, strategy, backtestDays, backtestTimeframe]);
 
   const loadSavedRun = useCallback(async (runId) => {
@@ -597,11 +612,11 @@ export default function BacktestResultsPanel({
               variant="ghost"
               size="xs"
               className="h-6 text-[0.62rem]"
-              onClick={() => setBacktestLabOpen(true)}
-              title="Open full backtest report"
+              onClick={() => openBacktestLabResults()}
+              title="Open Backtest Lab → Results"
             >
               <Maximize2 data-icon="inline-start" />
-              Report
+              Lab
             </Button>
           )}
           <Button
@@ -610,7 +625,7 @@ export default function BacktestResultsPanel({
             size="xs"
             className="h-6 text-[0.62rem]"
             onClick={onExportPdf}
-            title="Print / save as PDF"
+            title="Download PDF report with price chart and trades"
           >
             <FileText data-icon="inline-start" />
             PDF
@@ -633,6 +648,18 @@ export default function BacktestResultsPanel({
       <div className="algo-backtest-lab__body">
       <BacktestSummaryCards summary={summary} results={results} isFull={isFull} />
 
+      <section className="algo-backtest-lab__section algo-backtest-lab__section--advisor">
+        <StrategySuggestPanel
+          botId={advisorBotId}
+          candidateBots={activeBots}
+          backtestDays={backtestDays}
+          recentResults={results}
+          agentLlmAvailable={agentLlmAvailable}
+          symbol={symbol ?? results?.meta?.symbol}
+          compact={!isFull}
+        />
+      </section>
+
       {isFull && <PortfolioResultsSection results={results} />}
       {isFull && <MonteCarloSection monteCarlo={results?.monte_carlo} />}
       {isFull && <FilterRejectsSection summary={summary} />}
@@ -645,10 +672,7 @@ export default function BacktestResultsPanel({
         <button
           type="button"
           className="algo-backtest-sweep-teaser text-[0.62rem] text-primary hover:underline text-left px-1 py-1"
-          onClick={() => {
-            setBacktestLabTab('optimizer');
-            setBacktestLabOpen(true);
-          }}
+          onClick={() => useStore.getState().openBacktestLab('optimizer')}
         >
           {results.sweep.configs_tested ?? results.sweep.results.length} configs tested → Open optimizer
         </button>
@@ -657,13 +681,20 @@ export default function BacktestResultsPanel({
       {isFull && (
         <div className="algo-backtest-lab__tools-grid">
           <BacktestComparePanel
-            currentRun={{ run_id: results.run_id, summary }}
+            currentRun={{ run_id: results.run_id, results }}
             recentRuns={recentRuns}
           />
         </div>
       )}
 
       <section className="algo-backtest-lab__section algo-backtest-lab__section--chart">
+        <BacktestPriceChart
+          symbol={symbol ?? results?.meta?.symbol}
+          meta={results?.meta}
+          timeframe={backtestTimeframe ?? results?.meta?.timeframe ?? '1m'}
+          trades={displayTrades}
+          className={isFull ? 'backtest-price-chart-wrap--lab' : undefined}
+        />
         <BacktestMiniChart
           equityCurve={results.equity_curve}
           drawdownCurve={results.drawdown_curve}
