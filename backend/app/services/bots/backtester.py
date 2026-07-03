@@ -585,6 +585,9 @@ class BacktesterService:
                 "reason": "ENTRY_SHORT",
                 "fee": round(entry_fee, 4),
             })
+            snap = signal_data.get("insight_snapshot")
+            if snap:
+                trade_log[-1]["insight_snapshot"] = snap
             last_signal_bar_time = bar_time
 
         eval_bars = max(len(df) - start_i, 1)
@@ -646,7 +649,9 @@ class BacktesterService:
                         signal = None
 
             if not position and signal == "BUY":
-                _try_entry(signal, signal_data, row, bar_time)
+                direction_mode = str(cfg.get("direction_mode", "LONG_ONLY")).upper()
+                if research or direction_mode in ("BOTH", "LONG_ONLY"):
+                    _try_entry(signal, signal_data, row, bar_time)
             elif not position and signal == "SELL":
                 direction_mode = str(cfg.get("direction_mode", "LONG_ONLY")).upper()
                 if research or direction_mode in ("BOTH", "SHORT_ONLY"):
@@ -693,6 +698,8 @@ class BacktesterService:
             equity_curve=equity_curve,
             candles=candles,
             starting_equity=starting_equity,
+            feed=getattr(self.screener, "feed", None),
+            symbol=symbol,
         )
         if summary.get("max_drawdown") and float(summary["max_drawdown"]) > 0:
             ret = float(summary.get("return_pct") or 0)
@@ -706,7 +713,7 @@ class BacktesterService:
             starting_equity=starting_equity,
         )
 
-        return {
+        result = {
             "win_rate": summary["win_rate"],
             "total_pnl": summary["total_pnl"],
             "max_drawdown": summary["max_drawdown"],
@@ -721,6 +728,8 @@ class BacktesterService:
             "trades_total": len(trade_log),
             "summary": summary,
             "sim_mode": sim_mode,
+            "regime": summary.get("regime"),
+            "benchmark_overlays": summary.get("benchmark_overlays"),
             "costs": {
                 "slippage_bps": slippage_bps,
                 "fee_bps": fee_bps,
@@ -728,3 +737,5 @@ class BacktesterService:
             },
             "monte_carlo": monte_carlo,
         }
+
+        return result
