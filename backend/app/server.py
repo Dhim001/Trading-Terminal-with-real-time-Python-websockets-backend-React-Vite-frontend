@@ -66,7 +66,7 @@ from app.services.runtime.shutdown import (
 )
 from app.services.runtime.startup_recovery import run_startup_recovery
 from app.services.runtime import system_state
-from app.services.archive.runtime import archive_capture_loop, archive_rollup_loop, archive_startup_backfill
+from app.services.archive.runtime import archive_capture_loop, archive_ingestion_loop, archive_rollup_loop, archive_startup_pipeline
 from app.services.events import channels, publish as event_publish
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -143,9 +143,9 @@ async def simulated_market_loop():
             if tick_count % 120 == 0 and hasattr(feed, "persist_state"):
                 feed.persist_state()
             if tick_count % 12 == 0:
-                from app.database import get_db_stats
+                from app.services.db_stats_cache import get_db_stats_cached
 
-                stats = await asyncio.to_thread(get_db_stats)
+                stats = await asyncio.to_thread(get_db_stats_cached)
                 stats["clients"] = len(manager.connected_clients)
                 stats["tick_interval"] = feed.tick_interval
                 stats["volatility_multiplier"] = feed.volatility_multiplier
@@ -271,24 +271,27 @@ async def live_massive_market_broadcast_loop():
 
 
 async def diagnostics_broadcast_loop():
+    from app.config import DIAGNOSTICS_INTERVAL_SEC
+    from app.services.db_stats_cache import get_db_stats_cached
+    from app.services.data_quality.monitor import evaluate_symbols, data_quality_stats_from_report
+
     manager = state.manager
     feed = state.feed
+    interval = max(5.0, float(DIAGNOSTICS_INTERVAL_SEC))
     while True:
         try:
-            from app.database import get_db_stats
-            from app.services.data_quality.monitor import evaluate_symbols, data_quality_stats_from_report
-
-            stats = await asyncio.to_thread(get_db_stats)
+            stats = await asyncio.to_thread(get_db_stats_cached)
             symbols = list(getattr(feed, "symbols", []) or [])
             if symbols and not stats.get("data_quality"):
-                stats["data_quality"] = data_quality_stats_from_report(evaluate_symbols(symbols))
+                report = await asyncio.to_thread(evaluate_symbols, symbols)
+                stats["data_quality"] = data_quality_stats_from_report(report)
             stats["clients"] = len(manager.connected_clients)
             stats["tick_interval"] = 1.0
             stats["volatility_multiplier"] = 1.0
             await publish_system_stats(manager.broadcast, stats)
         except Exception as e:
             logging.error("Error in diagnostics loop: %s", e)
-        await asyncio.sleep(5)
+        await asyncio.sleep(interval)
 
 
 async def _send_ws_bootstrap_payloads(websocket):
@@ -476,9 +479,17 @@ async def main():
                 tasks.append(asyncio.create_task(diagnostics_broadcast_loop()))
 
             if ARCHIVE_ENABLED:
-                tasks.append(asyncio.create_task(archive_startup_backfill(state.feed)))
+                from app.config import (
+                    ARCHIVE_BACKFILL_ON_STARTUP,
+                    ARCHIVE_INGESTION_ENABLED,
+                    ARCHIVE_INGESTION_ON_STARTUP,
+                )
+                if ARCHIVE_BACKFILL_ON_STARTUP or ARCHIVE_INGESTION_ON_STARTUP:
+                    tasks.append(asyncio.create_task(archive_startup_pipeline(state.feed)))
                 tasks.append(asyncio.create_task(archive_capture_loop(state.feed)))
                 tasks.append(asyncio.create_task(archive_rollup_loop(state.feed)))
+                if ARCHIVE_INGESTION_ENABLED:
+                    tasks.append(asyncio.create_task(archive_ingestion_loop(state.feed)))
 
             if ARCHIVE_TICKS_ENABLED:
                 from app.services.archive.tick_writer import tick_flush_loop
@@ -503,6 +514,21 @@ async def main():
             tasks.append(asyncio.create_task(backtest_job_worker_loop(state)))
 
             await wait_for_shutdown_or_tasks(tasks, shutdown_event)
+    except OSError as exc:
+        port_in_use = (
+            getattr(exc, "winerror", None) == 10048
+            or getattr(exc, "errno", None) in (48, 98, 10048)
+        )
+        if port_in_use:
+            logging.critical(
+                "Cannot bind WebSocket port %s:%s — already in use. "
+                "Stop the other backend or run: .\\scripts\\start-massive.ps1 -Recycle",
+                WS_HOST,
+                WS_PORT,
+            )
+        else:
+            logging.critical("Server bind failed on %s:%s: %s", WS_HOST, WS_PORT, exc)
+        raise
     finally:
         await graceful_shutdown(
             bot_manager=state.bot_manager if runs_bot_engine_inline() else None,

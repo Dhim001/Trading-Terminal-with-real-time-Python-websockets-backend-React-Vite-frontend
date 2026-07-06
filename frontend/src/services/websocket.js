@@ -1,6 +1,7 @@
 import { useStore } from '../store/useStore';
 import { Action, MessageType } from '../api/protocol';
-import { applyServerMessage, getStoreActions } from '../api/dispatch';
+import { applyServerMessage, getStoreActions, resetBacktestRunState, errorAffectsBacktestRun } from '../api/dispatch';
+import { toast } from 'sonner';
 import { runBootstrap, resubscribeMarketSymbols } from '../api/bootstrap';
 import { WS_URL } from '../api/config';
 import { CHART_SNAPSHOT_BARS } from './candleBuffer';
@@ -47,7 +48,18 @@ function attachWebSocketHandlers(socket) {
       const { type, data, message, meta } = payload;
 
       if (type === MessageType.ERROR) {
-        console.error('Server execution error:', message);
+        const errMsg = message || data?.message || 'Server error';
+        console.error('Server execution error:', errMsg);
+        if (useStore.getState().backtestRunning) {
+          if (errorAffectsBacktestRun(errMsg)) {
+            resetBacktestRunState(storeActions, { errorMessage: errMsg });
+            toast.error(errMsg);
+          } else {
+            toast.message(errMsg);
+          }
+        } else {
+          toast.error(errMsg);
+        }
         return;
       }
 

@@ -2,11 +2,16 @@
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from app.config import (
     BOT_MIN_NOTIONAL,
     BOT_DAILY_LOSS_LIMIT_PCT,
     BOT_MAX_ACTIVE_BOTS,
+    BOT_MAX_CONSECUTIVE_LOSSES,
+    BOT_LOSS_COOLOFF_SEC,
+    BOT_MAX_DRAWDOWN_PCT,
+    BOT_MAX_PER_SYMBOL,
     MAX_ORDER_VALUE,
 )
 from app.services.bots.portfolio_risk import (
@@ -104,6 +109,7 @@ class RiskGate:
         is_exit: bool,
         daily_pnl: float,
         position_size: float,
+        at_ts: float | int | None = None,
     ) -> RiskDecision:
         if not is_exit:
             blocked = self._kill_switch_block()
@@ -111,9 +117,42 @@ class RiskGate:
                 return blocked
 
             symbol = str(bot.get("symbol") or "")
-            in_window, window_reason = is_no_trade_window(None, symbol)
+            if at_ts is not None:
+                try:
+                    ref_dt = datetime.fromtimestamp(float(at_ts), tz=timezone.utc)
+                except (TypeError, ValueError, OSError, OverflowError):
+                    ref_dt = None
+            else:
+                ref_dt = None
+            in_window, window_reason = is_no_trade_window(ref_dt, symbol)
             if in_window:
                 return RiskDecision(False, window_reason)
+
+            from app.services.altdata.event_policy import check_entry_gates
+            import time as _time
+
+            bot_cfg = self._parse_bot_config(bot)
+            gate_ts = at_ts if at_ts is not None else _time.time()
+            allowed, gate_reason, _gate = check_entry_gates(
+                symbol, gate_ts, bot_cfg, is_exit=False,
+            )
+            if not allowed and gate_reason:
+                return RiskDecision(False, gate_reason)
+
+            # 4.1: Consecutive-loss auto-pause — block entries after N consecutive losses.
+            streak_decision = self._check_streak_and_cooloff(bot)
+            if streak_decision is not None:
+                return streak_decision
+
+            # 4.2: Max drawdown circuit breaker — per-bot cumulative DD limit.
+            dd_decision = self._check_max_drawdown(bot)
+            if dd_decision is not None:
+                return dd_decision
+
+            # 4.3: Per-symbol bot concentration — max N bots on same symbol.
+            sym_decision = self._check_symbol_concentration(bot)
+            if sym_decision is not None:
+                return sym_decision
 
         status = bot.get("status", "STOPPED")
         if status != "RUNNING" and not is_exit:
@@ -148,9 +187,6 @@ class RiskGate:
             return RiskDecision(False, "Quantity must be greater than 0.")
 
         notional = quantity * price
-        if notional > MAX_ORDER_VALUE:
-            capped = MAX_ORDER_VALUE / price
-            return RiskDecision(True, "Capped to MAX_ORDER_VALUE.", capped)
 
         if is_exit:
             if side == "SELL" and position_size <= 0:
@@ -185,12 +221,157 @@ class RiskGate:
                 f"Notional ${notional:.2f} below minimum ${BOT_MIN_NOTIONAL:.2f}.",
             )
 
-        if notional > allocation:
-            capped_qty = allocation / price
-            return RiskDecision(
-                True,
-                f"Reduced to allocation cap (${allocation:.0f}).",
-                capped_qty,
-            )
+        max_notional = MAX_ORDER_VALUE
+        if allocation > 0:
+            max_notional = min(allocation, MAX_ORDER_VALUE)
+        if notional > max_notional:
+            capped = max_notional / price
+            if allocation > 0 and allocation < MAX_ORDER_VALUE:
+                cap_label = f"allocation cap (${allocation:.0f})"
+            else:
+                cap_label = f"MAX_ORDER_VALUE (${MAX_ORDER_VALUE:,.0f})"
+            return RiskDecision(True, f"Reduced to {cap_label}.", capped)
 
         return RiskDecision(True, "OK", quantity)
+
+    # ── Streak & cooling-off gate ──────────────────────────────────────────
+
+    def _check_streak_and_cooloff(self, bot: dict) -> RiskDecision | None:
+        """Block entry if the bot is on a consecutive-loss streak or in cooling-off.
+
+        Configurable via BOT_MAX_CONSECUTIVE_LOSSES (default 5) and
+        BOT_LOSS_COOLOFF_SEC (default 300 = 5 min).
+        """
+        bot_id = bot.get("id", "")
+        if not bot_id:
+            return None
+
+        max_streak = int(
+            (bot.get("config") or {}).get(
+                "max_consecutive_losses", BOT_MAX_CONSECUTIVE_LOSSES
+            )
+        )
+        cooloff_sec = int(
+            (bot.get("config") or {}).get(
+                "loss_cooloff_sec", BOT_LOSS_COOLOFF_SEC
+            )
+        )
+
+        # Skip if disabled (0 = no limit)
+        if max_streak <= 0 and cooloff_sec <= 0:
+            return None
+
+        from app.services.bots import analytics as bot_analytics
+
+        streak = bot_analytics.get_recent_consecutive_losses(bot_id)
+
+        # Consecutive-loss gate
+        if max_streak > 0 and streak >= max_streak:
+            return RiskDecision(
+                False,
+                f"Consecutive-loss streak ({streak}) reached limit ({max_streak}). "
+                "Auto-paused — resume manually or wait for cooloff.",
+            )
+
+        # Cooling-off gate: after a losing exit, wait cooloff_sec before next entry
+        if cooloff_sec > 0 and streak > 0:
+            last_exit_ts = bot_analytics.last_exit_timestamp(bot_id)
+            if last_exit_ts:
+                import time
+                from datetime import datetime, timezone
+
+                try:
+                    if isinstance(last_exit_ts, str):
+                        if last_exit_ts.endswith("Z"):
+                            last_exit_ts = last_exit_ts[:-1] + "+00:00"
+                        dt = datetime.fromisoformat(last_exit_ts)
+                    else:
+                        dt = datetime.fromtimestamp(float(last_exit_ts), tz=timezone.utc)
+                    elapsed = time.time() - dt.timestamp()
+                    if elapsed < cooloff_sec:
+                        remaining = int(cooloff_sec - elapsed)
+                        return RiskDecision(
+                            False,
+                            f"Cooling-off after loss: {remaining}s remaining "
+                            f"(streak {streak}, cooloff {cooloff_sec}s).",
+                        )
+                except (TypeError, ValueError, OSError):
+                    pass
+
+        return None
+
+    # ── Config helper ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_bot_config(bot: dict) -> dict:
+        """Safely extract bot config as a dict (may be JSON string in DB)."""
+        cfg = bot.get("config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg) if cfg else {}
+            except (json.JSONDecodeError, TypeError):
+                cfg = {}
+        return cfg if isinstance(cfg, dict) else {}
+
+    # ── Max drawdown circuit breaker ──────────────────────────────────────
+
+    def _check_max_drawdown(self, bot: dict) -> RiskDecision | None:
+        """Block entries if the bot's cumulative drawdown exceeds BOT_MAX_DRAWDOWN_PCT.
+
+        Looks at the bot's total PnL relative to its allocation.  If cumulative
+        losses exceed the configured percentage, the bot is paused.
+        """
+        bot_cfg = self._parse_bot_config(bot)
+        max_dd_pct = float(
+            bot_cfg.get("max_drawdown_pct", BOT_MAX_DRAWDOWN_PCT)
+        )
+        if max_dd_pct <= 0:
+            return None
+
+        allocation = float(bot.get("allocation") or 0)
+        if allocation <= 0:
+            return None
+
+        total_pnl = float(bot.get("total_pnl") or bot.get("pnl") or 0)
+        if total_pnl >= 0:
+            return None  # no drawdown
+
+        dd_pct = abs(total_pnl) / allocation * 100.0
+        if dd_pct >= max_dd_pct:
+            return RiskDecision(
+                False,
+                f"Max drawdown circuit breaker: bot DD {dd_pct:.1f}% "
+                f"exceeds limit {max_dd_pct:.1f}%. Auto-paused.",
+            )
+        return None
+
+    # ── Per-symbol bot concentration ─────────────────────────────────────
+
+    def _check_symbol_concentration(self, bot: dict) -> RiskDecision | None:
+        """Limit concurrent bots on the same symbol."""
+        bot_cfg = self._parse_bot_config(bot)
+        max_per_sym = int(
+            bot_cfg.get("max_bots_per_symbol", BOT_MAX_PER_SYMBOL)
+        )
+        if max_per_sym <= 0:
+            return None
+
+        symbol = str(bot.get("symbol") or "")
+        bot_id = bot.get("id", "")
+        if not symbol:
+            return None
+
+        try:
+            from app.services.bots.analytics import get_active_bots_for_symbol
+
+            active = get_active_bots_for_symbol(symbol, exclude_bot_id=bot_id)
+            if active >= max_per_sym:
+                return RiskDecision(
+                    False,
+                    f"Per-symbol limit: {active} active bots on {symbol} "
+                    f"(max {max_per_sym}). Blocked.",
+                )
+        except (ImportError, Exception):
+            pass  # graceful degrade if analytics function not available
+
+        return None

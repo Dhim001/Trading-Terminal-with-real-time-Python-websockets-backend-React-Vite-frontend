@@ -26,6 +26,7 @@ from app.services.bots.risk_sizing import RISK_PCT
 from app.services.bots import analytics as bot_analytics
 from app.services.bots import positions as bot_positions
 from app.services.bots import signal_ledger
+from app.services.bots.config_validation import normalize_bot_config, sanitize_bot_config
 from app.services.runtime import system_state
 
 ACTIVE_STATUSES = ("RUNNING", "PAUSED", "ERROR")
@@ -155,6 +156,16 @@ class BotManagerService:
             loaded_ids.add(bot_id)
             self.active_bots[bot_id] = dict(row)
             self.active_bots[bot_id]["config"] = json.loads(row["config"])
+            cfg, cfg_warnings = sanitize_bot_config(self.active_bots[bot_id]["config"])
+            if cfg != self.active_bots[bot_id]["config"]:
+                self.active_bots[bot_id]["config"] = cfg
+                cursor.execute(
+                    "UPDATE bots SET config = ? WHERE id = ?",
+                    (json.dumps(cfg), bot_id),
+                )
+                conn.commit()
+            for msg in cfg_warnings:
+                self.logger.warning("Bot %s config: %s", bot_id[:8], msg)
             prev = runtime_state.get(bot_id)
             self.active_bots[bot_id]["last_signal_bar_time"] = (
                 prev["last_signal_bar_time"] if prev else None
@@ -307,6 +318,22 @@ class BotManagerService:
     def _get_bot_position_size(self, bot_id: str, symbol: str) -> float:
         return bot_positions.get_bot_size(bot_id, symbol)
 
+    def _get_model_staleness(self, bot_id: str) -> dict | None:
+        """Return model staleness report, or None if meta-label not configured."""
+        try:
+            bot = self.active_bots.get(bot_id) or {}
+            cfg = bot.get("config") or {}
+            if isinstance(cfg, str):
+                import json as _json
+                cfg = _json.loads(cfg) if cfg else {}
+            mode = str(cfg.get("meta_label_model_mode", "")).lower()
+            if mode not in ("gbm", "hybrid") and not cfg.get("meta_label_model_enabled"):
+                return None
+            from app.services.bots.meta_label_operational import get_model_staleness_report
+            return get_model_staleness_report(bot_id)
+        except Exception:
+            return None
+
     def _get_position(self, symbol: str) -> dict:
         positions = self.oms.get_account_data().get("positions", {})
         return positions.get(symbol) or {}
@@ -400,6 +427,8 @@ class BotManagerService:
             "stats": stats,
             "trades": bot_analytics.get_trades(bot_id, 50),
             "snapshots": bot_analytics.get_snapshots(bot_id, 30),
+            "consecutive_losses": bot_analytics.get_recent_consecutive_losses(bot_id),
+            "model_staleness": self._get_model_staleness(bot_id),
         }
 
     async def update_bot_config(self, bot_id: str, config_patch: dict) -> dict:
@@ -422,6 +451,10 @@ class BotManagerService:
             bot["config"] = json.loads(bot["config"])
 
         merged_config = {**(bot.get("config") or {}), **config_patch}
+        merged_config = normalize_bot_config(
+            merged_config,
+            bot_timeframe=bot.get("timeframe"),
+        )
         bot_cfg = merge_tp_config(bot.get("strategy", ""), merged_config)
 
         conn = get_connection()
@@ -809,6 +842,25 @@ class BotManagerService:
                         await self.log_bot_event(
                             bot_id, "WARN",
                             f"Filter gate blocked {signal}: {reason}",
+                        )
+                        continue
+
+                # Event gates apply to new entries only — never block exit signals.
+                if signal in ("BUY", "SELL") and pos_size == 0:
+                    from app.services.altdata.event_policy import check_entry_gates
+
+                    gate_ok, gate_reason, gate_kind = check_entry_gates(
+                        symbol, bar_time, bot_config, is_exit=False,
+                    )
+                    if not gate_ok and gate_reason:
+                        inc(
+                            "bot_orders_blocked_total",
+                            labels={"strategy": strat_key, "reason": gate_kind or "event"},
+                        )
+                        await self.log_bot_event(
+                            bot_id, "WARN",
+                            f"Event gate blocked {signal}: {gate_reason}",
+                            meta={"event_type": "event_gate", "gate": gate_kind},
                         )
                         continue
 
@@ -1243,6 +1295,22 @@ class BotManagerService:
                         from app.services.bots.calibration import get_calibration_store
 
                         get_calibration_store().invalidate(bot_id)
+
+                        # Track meta-label prediction accuracy for staleness monitoring
+                        try:
+                            from app.services.bots.meta_label_operational import record_prediction_outcome
+
+                            entry_snap = insight_snapshot or signal_data.get("insight_snapshot")
+                            if entry_snap and trade_pnl is not None:
+                                pred_prob = entry_snap.get("meta_label_prob")
+                                if pred_prob is not None:
+                                    record_prediction_outcome(
+                                        bot_id,
+                                        predicted_prob=float(pred_prob),
+                                        actual_win=(trade_pnl > 0),
+                                    )
+                        except Exception:
+                            pass
                     self.record_snapshot_for_bot(bot_id)
                     signal_ledger.mark_signal_filled(signal_id, order_id=order_id)
 
@@ -1340,6 +1408,7 @@ class BotManagerService:
             tf = normalize_timeframe(timeframe or "1m")
         if strategy == "CHART_AGENT":
             config = {**(config or {}), "symbol": symbol, "timeframe": tf}
+        config, _ = sanitize_bot_config(config or {})
 
         bot_id = str(uuid.uuid4())
         conn = get_connection()

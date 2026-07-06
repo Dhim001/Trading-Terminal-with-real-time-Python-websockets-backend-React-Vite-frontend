@@ -35,8 +35,19 @@ const setLocal = (key, val) => {
   } catch (_) {}
 };
 
+/** Memory-efficient revision bump — mutates a shallow clone only when needed.
+ *  Prunes keys that exceed MAX_REVISION_KEYS to prevent unbounded growth. */
+const MAX_REVISION_KEYS = 30;
 export function bumpRevision(revisions, symbol) {
-  return { ...revisions, [symbol]: (revisions[symbol] || 0) + 1 };
+  const next = { ...revisions, [symbol]: (revisions[symbol] || 0) + 1 };
+  const keys = Object.keys(next);
+  if (keys.length > MAX_REVISION_KEYS) {
+    // Drop oldest keys (first inserted — JS object key order is insertion-order)
+    for (const k of keys.slice(0, keys.length - MAX_REVISION_KEYS)) {
+      delete next[k];
+    }
+  }
+  return next;
 }
 
 export const useStore = create(subscribeWithSelector((set, get) => ({
@@ -46,6 +57,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   activeSymbol: getLocal('terminal_active_symbol', 'BTCUSDT'),
   viewMode: getLocal('terminal_view_mode', 'single'),
   terminalMode: 'SIMULATED',
+  isOperator: false,
   orderCapabilities: null,
   terminalRole: 'all',
   distributed: false,
@@ -100,6 +112,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     trailing_stop_percent: 2,
     take_profit_percent: 3,
     tp_mode: 'percent',
+    direction_mode: 'LONG_ONLY',
   }),
   botLogs: [],
 
@@ -116,6 +129,8 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   /** Fingerprint of params used for the last completed backtest run */
   backtestSnapshot: null,
   backtestOverlay: null,
+  backtestLastError: null,
+  backtestLastRequest: null,
   chartInteractionMode: 'normal',
   strategyTemplates: [
     { id: 't1', name: 'Bull Market Scalper', strategy: 'MACD_RSI', execution_mode: 'BAR_CLOSE', allocation: 2000, config: { rsi_length: 14, macd_fast: 12, macd_slow: 26, trailing_stop_percent: 1.5, take_profit_percent: 3, tp_mode: 'percent' } },
@@ -124,7 +139,7 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     { id: 't4', name: 'VWAP Pullback', strategy: 'VWAP_PULLBACK', execution_mode: 'BAR_CLOSE', allocation: 1500, config: { trailing_stop_percent: 2, take_profit_percent: 2.5, tp_mode: 'percent' } },
     { id: 't5', name: 'Tick Momentum', strategy: 'TICK_MOMENTUM', execution_mode: 'TICK', allocation: 1000, config: { lookback_ticks: 20, tick_cooldown_sec: 10, take_profit_percent: 0.2, tp_mode: 'percent' } },
     { id: 't6', name: 'Tick Mean Revert', strategy: 'TICK_MEAN_REVERT', execution_mode: 'TICK', allocation: 1000, config: { lookback_ticks: 30, tick_cooldown_sec: 15, take_profit_percent: 0.15, tp_mode: 'percent' } },
-    { id: 't7', name: 'Chart Analyst Agent', strategy: 'CHART_AGENT', execution_mode: 'BAR_CLOSE', allocation: 2000, config: { min_confidence: 0.55, use_llm: false, trailing_stop_percent: 2, take_profit_percent: 3, tp_mode: 'percent' } },
+    { id: 't7', name: 'Chart Analyst Agent', strategy: 'CHART_AGENT', execution_mode: 'BAR_CLOSE', allocation: 2000, config: { min_confidence: 0.55, use_llm: false, trailing_stop_percent: 2, take_profit_percent: 3, tp_mode: 'percent', direction_mode: 'BOTH' } },
     { id: 't8', name: 'ICT Smart Money', strategy: 'ICT_SMC', execution_mode: 'BAR_CLOSE', allocation: 2000, config: { ob_lookback: 10, fvg_min_gap_pct: 0.0005, sweep_lookback: 20, trailing_stop_percent: 2, take_profit_percent: 3, tp_mode: 'percent', direction_mode: 'BOTH' } },
     { id: 't9', name: 'Donchian Breakout', strategy: 'DONCHIAN_BREAKOUT', execution_mode: 'BAR_CLOSE', allocation: 3000, config: { breakout_length: 20, exit_length: 10, atr_confirm_mult: 1.0, trailing_stop_percent: 3, take_profit_percent: 4, tp_mode: 'percent', direction_mode: 'BOTH' } },
     { id: 't10', name: 'Market Maker', strategy: 'MARKET_MAKING', execution_mode: 'BAR_CLOSE', allocation: 5000, config: { spread_pct: 0.002, max_skew: 0.5, vol_shutdown_mult: 2.5, inventory_target: 0, trailing_stop_percent: 1, tp_mode: 'none', direction_mode: 'BOTH' } },
@@ -150,9 +165,15 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   chartSlTpDraft: null,
 
   setScanResults: (data) => set({ scanResults: data }),
-  setVisionReport: (key, report) => set((state) => ({
-    visionReports: { ...state.visionReports, [key]: report },
-  })),
+  setVisionReport: (key, report) => set((state) => {
+    const next = { ...state.visionReports, [key]: report };
+    // FIX 1: Cap to 10 entries — vision reports contain large base64 images
+    const keys = Object.keys(next);
+    if (keys.length > 10) {
+      for (const k of keys.slice(0, keys.length - 10)) delete next[k];
+    }
+    return { visionReports: next };
+  }),
   setChartDrawings: (symbol, drawings) => set((state) => ({
     chartDrawings: { ...state.chartDrawings, [symbol]: drawings },
   })),
@@ -313,11 +334,12 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
 
   setTerminalMode: (mode) => set({ terminalMode: mode, isLive: mode !== 'SIMULATED' }),
 
-  setTerminalConfig: ({ terminalMode, executionMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge, agentLlmEnabled, agentLlmAvailable, agentLlmProvider, agentLlmModel, agentLlmModels, agentVisionEnabled, agentEnabled, scannerEnabled, orderCapabilities }) => set((state) => ({
+  setTerminalConfig: ({ terminalMode, executionMode, allowLiveBots, allowCustomStrategies, symbols, terminalRole, distributed, botMinCandles, archiveTicksEnabled, archiveParquetEnabled, archiveBackend, workerAlive, workerHeartbeatAge, agentLlmEnabled, agentLlmAvailable, agentLlmProvider, agentLlmModel, agentLlmModels, agentVisionEnabled, agentEnabled, scannerEnabled, orderCapabilities, isOperator }) => set((state) => ({
     terminalMode: terminalMode ?? state.terminalMode,
     executionMode: executionMode ?? state.executionMode,
     isLive: (terminalMode ?? state.terminalMode) !== 'SIMULATED',
     orderCapabilities: orderCapabilities ?? state.orderCapabilities,
+    isOperator: isOperator !== undefined ? isOperator : state.isOperator,
     allowLiveBots: allowLiveBots ?? state.allowLiveBots,
     allowCustomStrategies: allowCustomStrategies ?? state.allowCustomStrategies,
     terminalRole: terminalRole ?? state.terminalRole,
@@ -345,9 +367,15 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   },
 
   agentDeepReasoning: {},
-  setAgentDeepReasoning: (insightId, data) => set((state) => ({
-    agentDeepReasoning: { ...state.agentDeepReasoning, [insightId]: data },
-  })),
+  setAgentDeepReasoning: (insightId, data) => set((state) => {
+    const next = { ...state.agentDeepReasoning, [insightId]: data };
+    // FIX 2: Cap to 20 entries — LLM reasoning text accumulates
+    const keys = Object.keys(next);
+    if (keys.length > 20) {
+      for (const k of keys.slice(0, keys.length - 20)) delete next[k];
+    }
+    return { agentDeepReasoning: next };
+  }),
 
   setAmbiguousOrders: (orders) => set({ ambiguousOrders: Array.isArray(orders) ? orders : [] }),
 
@@ -410,6 +438,11 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
   setBacktestOos: (oos) => set({ backtestOos: Boolean(oos) }),
   setPendingDeploy: (pending) => set({ pendingDeploy: Boolean(pending) }),
   setBacktestSnapshot: (snapshot) => set({ backtestSnapshot: snapshot }),
+  setBacktestLastError: (error, request) => set({
+    backtestLastError: error ?? null,
+    backtestLastRequest: request ?? null,
+  }),
+  clearBacktestLastError: () => set({ backtestLastError: null, backtestLastRequest: null }),
   setBacktestOverlay: (overlay) => set({ backtestOverlay: overlay }),
   clearBacktestOverlay: () => set({ backtestOverlay: null }),
 
@@ -450,9 +483,20 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
     if (normalizeAnalystTimeframe(insight?.timeframe) === '1m') {
       nextInsights[sym] = insight;
     }
+    // FIX 4: Cap agentInsights to 30 keys
+    const iKeys = Object.keys(nextInsights);
+    if (iKeys.length > 30) {
+      for (const k of iKeys.slice(0, iKeys.length - 30)) delete nextInsights[k];
+    }
+    // Cap agentInsightHistory to 15 symbols
+    const nextHistoryMap = { ...state.agentInsightHistory, [sym]: nextHistory };
+    const hKeys = Object.keys(nextHistoryMap);
+    if (hKeys.length > 15) {
+      for (const k of hKeys.slice(0, hKeys.length - 15)) delete nextHistoryMap[k];
+    }
     return {
       agentInsights: nextInsights,
-      agentInsightHistory: { ...state.agentInsightHistory, [sym]: nextHistory },
+      agentInsightHistory: nextHistoryMap,
     };
   }),
 
@@ -601,10 +645,16 @@ export const useStore = create(subscribeWithSelector((set, get) => ({
 initCandleBufferCache(getLocal('terminal_active_symbol', 'BTCUSDT'));
 
 onCandleBufferEvict((symbol) => {
-  useStore.setState((state) => ({
-    candleRevision: bumpRevision(state.candleRevision, symbol),
-    candleHistoryRevision: bumpRevision(state.candleHistoryRevision, symbol),
-  }));
+  useStore.setState((state) => {
+    // FIX 5: Prune orderBooks and tickerData for evicted symbols
+    const nextOrderBooks = { ...state.orderBooks };
+    delete nextOrderBooks[symbol];
+    return {
+      candleRevision: bumpRevision(state.candleRevision, symbol),
+      candleHistoryRevision: bumpRevision(state.candleHistoryRevision, symbol),
+      orderBooks: nextOrderBooks,
+    };
+  });
 });
 
 if (import.meta.hot) {

@@ -1,9 +1,40 @@
 import { toast } from 'sonner';
 import { clearBacktestClientTimeout } from '../lib/backtestTimeouts';
+import { trimBacktestPayload, buildBacktestOverlay } from '../lib/backtestSlim';
+import { stopBacktestJobPolling, scheduleBacktestJobPoll } from '../lib/backtestPolling';
 import { MessageType } from './protocol';
 import { useStore } from '../store/useStore';
 import { forceMarketSnapshotSave } from '../services/marketSnapshot';
 import { queueMarketUpdate } from '../services/marketUpdateBatch';
+
+/** Background feature errors that must not cancel an in-flight backtest. */
+const BACKTEST_UNRELATED_ERROR_PATTERNS = [
+  /rate limited.*analyz/i,
+  /rate limited.*deep reason/i,
+  /rate limited.*scan/i,
+  /rate limited.*vision/i,
+  /rate limited.*trade action/i,
+  /chart analyst is disabled/i,
+  /not enough candle data for analysis/i,
+];
+
+/** True when a server ERROR should end the current backtest run. */
+export function errorAffectsBacktestRun(message) {
+  const msg = String(message || '').trim();
+  if (!msg) return false;
+  return !BACKTEST_UNRELATED_ERROR_PATTERNS.some((re) => re.test(msg));
+}
+
+/** Clear running backtest UI state after error, cancel, timeout, or completion. */
+export function resetBacktestRunState(storeActions, { errorMessage = null, request = null } = {}) {
+  stopBacktestJobPolling();
+  clearBacktestClientTimeout();
+  storeActions.setBacktestRunning(false);
+  storeActions.setBacktestProgress(null);
+  if (errorMessage) {
+    storeActions.setBacktestLastError?.(errorMessage, request);
+  }
+}
 
 /** Snapshot of Zustand actions for WS / HTTP message dispatch. */
 export function getStoreActions() {
@@ -29,6 +60,9 @@ export function getStoreActions() {
     setBacktestProgress: s.setBacktestProgress,
     setBacktestJobId: s.setBacktestJobId,
     setBacktestLabOpen: s.setBacktestLabOpen,
+    setBacktestSnapshot: s.setBacktestSnapshot,
+    setBacktestLastError: s.setBacktestLastError,
+    clearBacktestLastError: s.clearBacktestLastError,
     setBacktestOverlay: s.setBacktestOverlay,
     clearBacktestOverlay: s.clearBacktestOverlay,
     setStrategyCatalog: s.setStrategyCatalog,
@@ -114,8 +148,15 @@ export function applyServerMessage(type, data, storeActions, meta) {
     case MessageType.BACKTEST_PROGRESS:
       if (data?.job_id) storeActions.setBacktestJobId(data.job_id);
       storeActions.setBacktestProgress(data);
+      if (data?.phase === 'queued' && data?.job_id) {
+        storeActions.setBacktestRunning(true);
+        import('./endpoints').then(({ startBacktestJobPolling }) => {
+          startBacktestJobPolling(data.job_id, storeActions);
+        });
+      }
       break;
     case MessageType.BACKTEST_RESULT:
+      stopBacktestJobPolling();
       clearBacktestClientTimeout();
       storeActions.setBacktestRunning(false);
       storeActions.setBacktestProgress(null);
@@ -125,12 +166,14 @@ export function applyServerMessage(type, data, storeActions, meta) {
         break;
       }
       if (data?.status === 'success' && data?.results && !data.results.error) {
-        storeActions.setBacktestResults(data.results);
-        const sym = data.results?.meta?.symbol;
-        const pnl = data.results?.total_pnl;
-        const trades = data.results?.trade_count ?? 0;
-        const explained = data.results?.reasoning?.trade_count
-          ?? data.results?.reasoning?.trades?.length
+        storeActions.clearBacktestLastError?.();
+        const results = trimBacktestPayload(data.results);
+        storeActions.setBacktestResults(results);
+        const sym = results?.meta?.symbol;
+        const pnl = results?.total_pnl;
+        const trades = results?.trade_count ?? 0;
+        const explained = results?.reasoning?.trade_count
+          ?? results?.reasoning?.trades?.length
           ?? 0;
         const pnlLabel = pnl != null
           ? `${pnl >= 0 ? '+' : ''}$${Number(pnl).toFixed(2)}`
@@ -142,19 +185,12 @@ export function applyServerMessage(type, data, storeActions, meta) {
             onClick: () => useStore.getState().openBacktestLab('results'),
           },
         });
-        if (data.results?.meta?.symbol && data.results?.run_id) {
-          storeActions.setBacktestOverlay({
-            runId: data.results.run_id,
-            symbol: data.results.meta.symbol,
-            meta: data.results.meta,
-            trades: data.results.trades ?? [],
-            tradesTotal: data.results.trades_total ?? data.results.trades?.length ?? 0,
-            equityCurve: data.results.equity_curve ?? [],
-            visible: false,
-          });
+        const overlay = buildBacktestOverlay(results);
+        if (overlay) {
+          storeActions.setBacktestOverlay(overlay);
         }
-        if (data.results?.sweep) {
-          toast.success(`Sweep complete · best $${Number(data.results.total_pnl ?? 0).toFixed(2)}`);
+        if (results?.sweep) {
+          toast.success(`Sweep complete · best $${Number(results.total_pnl ?? 0).toFixed(2)}`);
         }
         import('./endpoints').then(({ fetchBacktestRuns }) => {
           fetchBacktestRuns(storeActions, sym);
@@ -162,7 +198,13 @@ export function applyServerMessage(type, data, storeActions, meta) {
       } else {
         const msg = data?.results?.error || data?.message || 'Backtest failed';
         console.error('Backtest failed:', msg);
-        toast.error(msg);
+        storeActions.setBacktestLastError?.(msg, data?.request ?? null);
+        toast.error(msg, {
+          action: {
+            label: 'Recovery',
+            onClick: () => useStore.getState().openBacktestLab('results'),
+          },
+        });
       }
       break;
     case MessageType.TICKS_UPDATE:
@@ -212,10 +254,22 @@ export function applyServerMessage(type, data, storeActions, meta) {
         storeActions.setVisionReport(`${data.symbol}:${data.timeframe}`, data);
       }
       break;
-    case MessageType.ERROR:
+    case MessageType.ERROR: {
       storeActions.setAnalyticsLoading(false);
-      console.error('Server execution error:', data?.message ?? data);
+      const errMsg = data?.message ?? (typeof data === 'string' ? data : null) ?? 'Server error';
+      console.error('Server execution error:', errMsg);
+      if (useStore.getState().backtestRunning) {
+        if (errorAffectsBacktestRun(errMsg)) {
+          resetBacktestRunState(storeActions, { errorMessage: errMsg });
+          toast.error(errMsg);
+        } else {
+          toast.message(errMsg);
+        }
+      } else {
+        toast.error(errMsg);
+      }
       break;
+    }
     default:
       console.warn('Unrecognized server message type:', type);
   }
