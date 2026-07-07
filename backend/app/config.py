@@ -87,6 +87,12 @@ WS_MAX_MESSAGE_SIZE = int(os.environ.get("WS_MAX_MESSAGE_SIZE", str(4 * 1024 * 1
 # MessagePack binary frames for large history/tick payloads (Phase 4 transport).
 WS_MSGPACK_ENABLED = os.environ.get("WS_MSGPACK_ENABLED", "true").lower() in ("1", "true", "yes")
 WS_MSGPACK_MIN_BYTES = int(os.environ.get("WS_MSGPACK_MIN_BYTES", "4096"))
+# WebSocket protocol keepalive (websockets.serve). Tolerate short event-loop stalls from
+# sync DB / bot work — default ping_timeout is 20s and drops clients under load.
+WS_PING_INTERVAL = float(os.environ.get("WS_PING_INTERVAL", "30"))
+WS_PING_TIMEOUT = float(os.environ.get("WS_PING_TIMEOUT", "90"))
+# Application-level keepalive broadcast when clients are connected (NAT / proxy idle).
+WS_KEEPALIVE_INTERVAL_SEC = float(os.environ.get("WS_KEEPALIVE_INTERVAL_SEC", "25"))
 
 # HTTP REST API (Phase 3) — runs alongside WebSocket in server/all roles
 HTTP_ENABLED = os.environ.get("HTTP_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -121,8 +127,16 @@ BACKTEST_JOB_RETENTION_DAYS = int(os.environ.get("BACKTEST_JOB_RETENTION_DAYS", 
 BACKTEST_PARALLEL_WORKERS = int(os.environ.get("BACKTEST_PARALLEL_WORKERS", "4"))
 # Run portfolio / sweep / WF / reasoning in a background asyncio task.
 BACKTEST_DEFER_HEAVY = os.environ.get("BACKTEST_DEFER_HEAVY", "true").lower() in ("1", "true", "yes")
+# Always queue sweep / walk-forward optimization (never inline on WS handler).
+BACKTEST_FORCE_DEFER_OPTIMIZATION = os.environ.get(
+    "BACKTEST_FORCE_DEFER_OPTIMIZATION", "true"
+).lower() in ("1", "true", "yes")
 # Inline WS handler runs under this estimate (seconds); slower jobs go to the queue.
 BACKTEST_INLINE_MAX_SEC = float(os.environ.get("BACKTEST_INLINE_MAX_SEC", "30"))
+# Tier 5 adaptive trial budget defaults (overridable per sweep request).
+BACKTEST_SWEEP_MAX_TRIALS = int(os.environ.get("BACKTEST_SWEEP_MAX_TRIALS", "200"))
+BACKTEST_SWEEP_MAX_GRID = int(os.environ.get("BACKTEST_SWEEP_MAX_GRID", "24"))
+BACKTEST_SWEEP_TIME_BUDGET_SEC = float(os.environ.get("BACKTEST_SWEEP_TIME_BUDGET_SEC", "300"))
 
 # Portfolio-level risk (all bots combined)
 PORTFOLIO_MAX_GROSS_EXPOSURE_PCT = float(os.environ.get("PORTFOLIO_MAX_GROSS_EXPOSURE_PCT", "80"))
@@ -264,6 +278,14 @@ SENTIMENT_SCORE_THRESHOLD = float(os.environ.get("SENTIMENT_SCORE_THRESHOLD", "0
 # Finnhub.io — company news + news-sentiment (https://finnhub.io/docs/api)
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 FINNHUB_API_URL = os.environ.get("FINNHUB_API_URL", "https://finnhub.io/api/v1").strip().rstrip("/")
+
+# Google News RSS (gnews package — keyword search, no API key)
+GNEWS_ENABLED = os.environ.get("GNEWS_ENABLED", "true").lower() in ("1", "true", "yes")
+try:
+    GNEWS_MAX_RESULTS = int(os.environ.get("GNEWS_MAX_RESULTS", "15"))
+except ValueError:
+    GNEWS_MAX_RESULTS = 15
+GNEWS_PERIOD = os.environ.get("GNEWS_PERIOD", "7d").strip() or "7d"
 
 # Strategy advisor — LLM-suggested bot params with optional shadow backtest
 STRATEGY_ADVISOR_ENABLED = os.environ.get("STRATEGY_ADVISOR_ENABLED", "true").lower() in ("1", "true", "yes")
