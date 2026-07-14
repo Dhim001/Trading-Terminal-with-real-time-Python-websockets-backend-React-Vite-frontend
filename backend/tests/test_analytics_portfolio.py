@@ -10,9 +10,11 @@ import app.db.connection as db_conn
 from app.database import get_connection, init_db
 from app.services.analytics.portfolio import (
     MANUAL_STRATEGY,
+    _fetch_account_exit_trades,
     collect_exit_trades,
     get_breakdown_stats,
     get_daily_pnl_calendar,
+    get_pnl_distribution,
     get_portfolio_equity_curve,
 )
 from app.services.bots import analytics as bot_analytics
@@ -84,10 +86,103 @@ class PortfolioAnalyticsTests(unittest.TestCase):
         total = sum(d["pnl"] for d in result["days"])
         self.assertEqual(total, 12.5)
 
+    def test_pnl_distribution_includes_skew_overlays(self):
+        result = get_pnl_distribution(self.account_history, source="combined")
+        self.assertGreaterEqual(len(result["bins"]), 1)
+        self.assertIn("skewness", result["moments"])
+        self.assertIn("excess_kurtosis", result["moments"])
+        self.assertEqual(result["moments"]["n"], 3)
+        self.assertTrue(len(result["density"]) >= 1)
+        self.assertEqual(len(result["qq"]), 3)
+        self.assertEqual(result["portfolio"]["unit"], "daily_pnl")
+        self.assertIn("moments", result["portfolio"])
+
+    def test_portfolio_daily_return_skew_uses_day_aggregates(self):
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        history = {
+            "trades": [
+                {
+                    "id": "d1",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "realized_pnl": 10.0,
+                    "timestamp": (now - timedelta(days=2)).isoformat(),
+                },
+                {
+                    "id": "d2",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "realized_pnl": -4.0,
+                    "timestamp": (now - timedelta(days=1)).isoformat(),
+                },
+                {
+                    "id": "d3a",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "realized_pnl": 5.0,
+                    "timestamp": now.isoformat(),
+                },
+                {
+                    "id": "d3b",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "realized_pnl": 1.0,
+                    "timestamp": now.isoformat(),
+                },
+            ],
+        }
+        result = get_pnl_distribution(history, source="account")
+        portfolio = result["portfolio"]
+        self.assertEqual(portfolio["n_days"], 3)
+        self.assertEqual(portfolio["moments"]["n"], 3)
+        self.assertTrue(len(portfolio["density"]) >= 1)
+        self.assertEqual(len(portfolio["qq"]), 3)
+
     def test_source_filter_bot_only(self):
         trades = collect_exit_trades(self.account_history, source="bot")
         self.assertEqual(len(trades), 2)
         self.assertTrue(all(t["source"] == "bot" for t in trades))
+
+    def test_account_exit_trades_use_realized_pnl_not_side(self):
+        ts = datetime.now(timezone.utc).isoformat()
+        history = {
+            "trades": [
+                {
+                    "id": "buy-entry",
+                    "symbol": "ETHUSDT",
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "realized_pnl": None,
+                    "timestamp": ts,
+                },
+                {
+                    "id": "sell-exit",
+                    "symbol": "ETHUSDT",
+                    "side": "SELL",
+                    "status": "FILLED",
+                    "realized_pnl": 5.0,
+                    "timestamp": ts,
+                },
+                {
+                    "id": "cover-exit",
+                    "symbol": "BTCUSDT",
+                    "side": "BUY",
+                    "status": "FILLED",
+                    "realized_pnl": 10.0,
+                    "timestamp": ts,
+                },
+            ],
+        }
+        exits = _fetch_account_exit_trades(history, 0.0)
+        self.assertEqual(len(exits), 2)
+        pnls = sorted(t["pnl"] for t in exits)
+        self.assertEqual(pnls, [5.0, 10.0])
 
     def test_correlation_respects_symbol_universe(self):
         from app.services.analytics.portfolio import get_correlation_matrix

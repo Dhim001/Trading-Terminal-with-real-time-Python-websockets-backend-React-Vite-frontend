@@ -1,7 +1,7 @@
 /**
  * Parameter sweep + walk-forward controls with strategy-aware param grid.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -17,6 +17,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useStore } from '../store/useStore';
+import { useResearchStore } from '../store/useResearchStore';
 import { sendAction } from '../api/transport';
 import { Action } from '../api/protocol';
 import { withLlmModel } from '../api/endpoints';
@@ -173,12 +174,14 @@ export default function BacktestSweepPanel({
   oosPct,
   results,
 }) {
-  const backtestRunning = useStore((s) => s.backtestRunning);
+  const backtestRunning = useResearchStore((s) => s.backtestRunning);
   const botConfig = useStore((s) => s.botConfig);
-  const optimizerPreset = useStore((s) => s.optimizerPreset);
-  const clearOptimizerPreset = useStore((s) => s.clearOptimizerPreset);
+  const optimizerPreset = useResearchStore((s) => s.optimizerPreset);
+  const clearOptimizerPreset = useResearchStore((s) => s.clearOptimizerPreset);
   const updateBotConfig = useStore((s) => s.updateBotConfig);
-  const setPendingDeploy = useStore((s) => s.setPendingDeploy);
+  const setBotTimeframe = useStore((s) => s.setBotTimeframe);
+  const setBotStrategy = useStore((s) => s.setBotStrategy);
+  const setPendingDeploy = useResearchStore((s) => s.setPendingDeploy);
   const agentLlmAvailable = useStore((s) => s.agentLlmAvailable);
 
   const paramDefs = useMemo(
@@ -205,14 +208,43 @@ export default function BacktestSweepPanel({
   const [portfolioSweep, setPortfolioSweep] = useState(false);
   const [autoDeploy, setAutoDeploy] = useState(false);
   const [autoDeployMinOosPnl, setAutoDeployMinOosPnl] = useState('0');
+  const prevStrategyRef = useRef(strategy);
 
+  // Only fully reset sweep axes when the strategy changes. Re-running on every
+  // botConfig tick was wiping user checkboxes / empty Values and leaving Run disabled.
   useEffect(() => {
+    if (prevStrategyRef.current === strategy) return;
+    prevStrategyRef.current = strategy;
     setEnabled(defaultSweepEnabled(strategy, paramDefs));
-    setValuesByKey((prev) => ({
-      ...defaultValuesForFields(paramDefs, botConfig),
-      ...prev,
-    }));
+    setValuesByKey(defaultValuesForFields(paramDefs, botConfig));
   }, [strategy, paramDefs, botConfig]);
+
+  // Seed newly appeared param keys without clobbering user edits.
+  useEffect(() => {
+    setValuesByKey((prev) => {
+      const defaults = defaultValuesForFields(paramDefs, botConfig);
+      let changed = false;
+      const next = { ...prev };
+      for (const [key, val] of Object.entries(defaults)) {
+        if (next[key] === undefined) {
+          next[key] = val;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+    setEnabled((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const def of paramDefs) {
+        if (next[def.key] === undefined) {
+          next[def.key] = false;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [paramDefs, botConfig]);
 
   useEffect(() => {
     if (!optimizerPreset) return;
@@ -266,6 +298,23 @@ export default function BacktestSweepPanel({
     () => estimateMaxBars(days, timeframe, symbol) < WALK_FORWARD_MIN_BARS,
     [days, timeframe, symbol],
   );
+  const sweepDisabledReason = backtestRunning
+    ? 'A backtest or sweep is already running'
+    : !sweepGrid
+      ? 'Enable at least one parameter and enter Values (e.g. 1, 2, 3)'
+      : null;
+
+  const toggleParamEnabled = (key, on, def) => {
+    setEnabled((prev) => ({ ...prev, [key]: on }));
+    if (!on) return;
+    setValuesByKey((prev) => {
+      if (String(prev[key] ?? '').trim()) return prev;
+      const seeded = defaultValuesForFields([def], botConfig)[key]
+        || def.placeholder
+        || '';
+      return { ...prev, [key]: seeded };
+    });
+  };
 
   const runSweep = async (walkForward = false) => {
     if (!sweepGrid) {
@@ -281,24 +330,38 @@ export default function BacktestSweepPanel({
       return;
     }
     if (backtestRunning) return;
-    useStore.getState().setBacktestRunning(true);
-    useStore.getState().setBacktestProgress({
+    useResearchStore.getState().setBacktestRunning(true);
+    useResearchStore.getState().setBacktestProgress({
       pct: 0,
       phase: 'sweep',
       message: walkForward ? 'Starting walk-forward…' : 'Starting sweep…',
     });
     const parsedDays = parseInt(days, 10) || 7;
-    const timeoutMs = getBacktestClientTimeoutMs({ reasoning, days: parsedDays })
-      * Math.max(1, Math.min(comboCount, 12));
+    const wfFolds = walkForward ? (rollingWf ? rollingFolds : 1) : 1;
+    const timeoutMs = getBacktestClientTimeoutMs({
+      reasoning,
+      days: parsedDays,
+      walkForward,
+      rollingFolds: wfFolds,
+      comboCount,
+      strategy,
+    });
     scheduleBacktestClientTimeout({
       reasoning,
       days: parsedDays,
+      walkForward,
+      rollingFolds: wfFolds,
+      comboCount,
       timeoutMs,
       onTimeout: (elapsedMs) => {
-        if (!useStore.getState().backtestRunning) return;
-        useStore.getState().setBacktestRunning(false);
-        useStore.getState().setBacktestProgress(null);
-        toast.error(`Sweep timed out after ${formatBacktestTimeoutLabel(elapsedMs)}`);
+        if (!useResearchStore.getState().backtestRunning) return;
+        useResearchStore.getState().setBacktestRunning(false);
+        useResearchStore.getState().setBacktestProgress(null);
+        toast.error(
+          walkForward
+            ? `Walk-forward timed out after ${formatBacktestTimeoutLabel(elapsedMs)} — try fewer folds/combos or increase VITE_BACKTEST_WALK_FORWARD_TIMEOUT_MS`
+            : `Sweep timed out after ${formatBacktestTimeoutLabel(elapsedMs)}`,
+        );
       },
     });
     const portfolioSymbols = portfolioSweep
@@ -345,8 +408,8 @@ export default function BacktestSweepPanel({
     if (!ok && error) toast.error(error);
     if (!ok) {
       clearBacktestClientTimeout();
-      useStore.getState().setBacktestRunning(false);
-      useStore.getState().setBacktestProgress(null);
+      useResearchStore.getState().setBacktestRunning(false);
+      useResearchStore.getState().setBacktestProgress(null);
     }
   };
 
@@ -365,8 +428,14 @@ export default function BacktestSweepPanel({
       return;
     }
     updateBotConfig(cfg);
+    // Optimizer TF/strategy must follow the run — deploy dialog used to keep
+    // AlgoPanel's current TF (often 1m) while params were fit on 1h/etc.
+    if (timeframe) setBotTimeframe(timeframe);
+    if (strategy) setBotStrategy(strategy);
     setPendingDeploy(true);
-    toast.success('Optimized params applied — confirm deploy');
+    toast.success(
+      `Optimized params applied (${strategy || 'strategy'} · ${timeframe || 'tf'}) — confirm deploy`,
+    );
   };
 
   const handleExportCsv = () => {
@@ -404,6 +473,7 @@ export default function BacktestSweepPanel({
             size="sm"
             className="algo-backtest-sweep__btn algo-backtest-sweep__btn--sweep"
             disabled={backtestRunning || !sweepGrid}
+            title={sweepDisabledReason || undefined}
             onClick={() => runSweep(false)}
           >
             Run sweep
@@ -416,13 +486,14 @@ export default function BacktestSweepPanel({
             disabled={backtestRunning || !sweepGrid || walkForwardTooFewBars}
             onClick={() => runSweep(true)}
             title={
-              walkForwardTooFewBars
-                ? `Need ~${WALK_FORWARD_MIN_BARS}+ bars for a 70/30 split — increase days or use a lower timeframe`
-                : wfMode === 'anchored' && rollingWf
-                  ? `Anchored walk-forward (${rollingFolds} folds) — expanding IS from series start`
-                  : rollingWf
-                    ? `Rolling walk-forward (${rollingFolds} folds) — optimize IS, validate OOS per slice`
-                    : 'Optimize on first 70% of bars, validate on last 30%'
+              sweepDisabledReason
+                || (walkForwardTooFewBars
+                  ? `Need ~${WALK_FORWARD_MIN_BARS}+ bars for a 70/30 split — increase days or use a lower timeframe`
+                  : wfMode === 'anchored' && rollingWf
+                    ? `Anchored walk-forward (${rollingFolds} folds) — expanding IS from series start`
+                    : rollingWf
+                      ? `Rolling walk-forward (${rollingFolds} folds) — optimize IS, validate OOS per slice`
+                      : 'Optimize on first 70% of bars, validate on last 30%')
             }
           >
             {wfMode === 'anchored' && rollingWf
@@ -494,7 +565,7 @@ export default function BacktestSweepPanel({
           />
           {comboCount > 0 && (
             <span className="text-[0.55rem] text-muted-foreground block mt-0.5">
-              WF floor: max({minTrades}, 5 × swept params)
+              WF floor: max({minTrades}, 5 × params with 2+ values)
             </span>
           )}
         </div>
@@ -572,6 +643,11 @@ export default function BacktestSweepPanel({
 
       <section className="algo-backtest-sweep__card algo-backtest-sweep__card--params" aria-label="Sweep parameters">
         <h5 className="algo-backtest-sweep__card-title">Parameters</h5>
+        {!sweepGrid && (
+          <p className="algo-backtest-sweep__hint">
+            Check at least one parameter and enter comma-separated Values to enable Run sweep.
+          </p>
+        )}
         <div className="algo-backtest-sweep__param-head" aria-hidden>
           <span />
           <span>Field</span>
@@ -589,7 +665,7 @@ export default function BacktestSweepPanel({
             <Checkbox
               id={`sweep-${def.key}`}
               checked={Boolean(enabled[def.key])}
-              onCheckedChange={(c) => setEnabled((prev) => ({ ...prev, [def.key]: c === true }))}
+              onCheckedChange={(c) => toggleParamEnabled(def.key, c === true, def)}
             />
             <Label
               htmlFor={`sweep-${def.key}`}

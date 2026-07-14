@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 
 from starlette.applications import Starlette
 from starlette.middleware.cors import CORSMiddleware
@@ -58,24 +60,57 @@ async def metrics(request: Request) -> PlainTextResponse:
     return PlainTextResponse(render_prometheus(), media_type="text/plain; version=0.0.4")
 
 
-async def health_live(request: Request) -> JSONResponse:
-    """Fast liveness probe — no DB or LLM."""
-    return JSONResponse({"ok": True, "service": "trading-terminal"})
-
-
-async def health_massive(request: Request) -> JSONResponse:
-    """Lightweight Massive feed status for UI banners (no DB/LLM)."""
-    state: AppState = request.app.state.terminal
+def _cheap_feed_snapshot(state: AppState) -> dict:
+    """In-memory feed fields safe for high-frequency probes (no DB/LLM)."""
+    body: dict = {
+        "ok": True,
+        "service": "trading-terminal",
+        "terminal_mode": TERMINAL_MODE,
+        "ws_clients": len(state.manager.connected_clients),
+    }
     feed = getattr(state, "feed", None)
-    body: dict = {"ok": True, "terminal_mode": TERMINAL_MODE}
+    if feed is not None and hasattr(feed, "feed_lag_sec"):
+        try:
+            lag = feed.feed_lag_sec()
+            if lag is not None:
+                body["feed_lag_sec"] = round(float(lag), 2)
+        except Exception:
+            pass
     if TERMINAL_MODE == "LIVE_MASSIVE" and feed is not None and hasattr(feed, "massive_status"):
         try:
             body["massive"] = feed.massive_status
         except Exception:
             body["massive"] = None
-    else:
+    if TERMINAL_MODE == "LIVE_IB" and feed is not None and hasattr(feed, "ib_status"):
+        try:
+            body["ib"] = feed.ib_status
+        except Exception:
+            body["ib"] = None
+    return body
+
+
+async def health_live(request: Request) -> JSONResponse:
+    """Fast liveness probe — no DB or LLM. Includes cheap in-memory feed fields."""
+    state: AppState = request.app.state.terminal
+    return JSONResponse(_cheap_feed_snapshot(state))
+
+
+async def health_massive(request: Request) -> JSONResponse:
+    """Lightweight Massive feed status for UI banners (no DB/LLM)."""
+    state: AppState = request.app.state.terminal
+    body = _cheap_feed_snapshot(state)
+    if "massive" not in body:
         body["massive"] = None
     return JSONResponse(body)
+
+
+# Full /health response cache — prevents poll storms from saturating the SQLite thread.
+_HEALTH_CACHE_TTL_SEC = 10.0
+_health_cache_body: dict | None = None
+_health_cache_ts: float = 0.0
+# Create the lock at import time so concurrent first hits cannot race two Lock()s.
+# (Lazy init of asyncio.Lock without a sync gate is racy under concurrent awaits.)
+_health_cache_lock = asyncio.Lock()
 
 
 async def admin_shutdown_handler(request: Request) -> JSONResponse:
@@ -96,13 +131,9 @@ async def admin_shutdown_handler(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "message": "shutdown requested"})
 
 
-async def health(request: Request) -> JSONResponse:
-    import asyncio
-    import time
-
+async def _build_health_body(state: AppState) -> dict:
     from app.services.agent.llm.router import get_llm_status
 
-    state: AppState = request.app.state.terminal
     body = {
         "ok": True,
         "service": "trading-terminal",
@@ -145,7 +176,7 @@ async def health(request: Request) -> JSONResponse:
         from app.db.connection import check_db_health
         from app.db.async_bridge import run_db
 
-        body["database"] = await run_db(check_db_health)
+        body["database"] = await run_db(check_db_health, light=True)
     except Exception as exc:
         body["database"] = {"ok": False, "error": str(exc)}
         body["ok"] = False
@@ -154,7 +185,8 @@ async def health(request: Request) -> JSONResponse:
         from app.db.async_bridge import run_db
         from app.services.db_stats_cache import get_db_stats_cached
 
-        stats = await run_db(get_db_stats_cached)
+        # Skip archive COUNT(*) on the hot health path — use light metrics only.
+        stats = await run_db(get_db_stats_cached, include_archive=False)
         body["metrics"] = {
             "open_positions": stats.get("positions_count", 0),
             "pending_orders": stats.get("pending_orders_count", 0),
@@ -223,7 +255,46 @@ async def health(request: Request) -> JSONResponse:
         except Exception:
             pass
 
-    return JSONResponse(body)
+    return body
+
+
+async def health(request: Request) -> JSONResponse:
+    """Full diagnostics probe — cached to avoid SQLite/LLM storms from UI pollers."""
+    global _health_cache_body, _health_cache_ts
+
+    force = request.query_params.get("fresh") in ("1", "true", "yes")
+    now = time.monotonic()
+    if (
+        not force
+        and _health_cache_body is not None
+        and (now - _health_cache_ts) < _HEALTH_CACHE_TTL_SEC
+    ):
+        cached = dict(_health_cache_body)
+        # Refresh live client count even on cache hit.
+        state: AppState = request.app.state.terminal
+        cached["ws_clients"] = len(state.manager.connected_clients)
+        cached["cached"] = True
+        return JSONResponse(cached)
+
+    async with _health_cache_lock:
+        now = time.monotonic()
+        if (
+            not force
+            and _health_cache_body is not None
+            and (now - _health_cache_ts) < _HEALTH_CACHE_TTL_SEC
+        ):
+            cached = dict(_health_cache_body)
+            state = request.app.state.terminal
+            cached["ws_clients"] = len(state.manager.connected_clients)
+            cached["cached"] = True
+            return JSONResponse(cached)
+
+        state = request.app.state.terminal
+        body = await _build_health_body(state)
+        body["cached"] = False
+        _health_cache_body = body
+        _health_cache_ts = time.monotonic()
+        return JSONResponse(body)
 
 
 async def list_strategies(request: Request) -> JSONResponse:
@@ -803,6 +874,7 @@ async def apply_calibration_suggestions_handler(request: Request) -> JSONRespons
             "applied": [],
             "patch": {},
             "message": result.get("message", "No suggestions to apply."),
+            "config_snapshot": result.get("config_snapshot") or {},
         })
 
     state: AppState = request.app.state.terminal
@@ -811,12 +883,26 @@ async def apply_calibration_suggestions_handler(request: Request) -> JSONRespons
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
 
+    # update_bot_config returns get_bot_detail() envelope {bot, position, ...}.
+    bot = detail.get("bot") if isinstance(detail, dict) else None
+    if not isinstance(bot, dict):
+        bot = detail if isinstance(detail, dict) else {}
+    cfg = bot.get("config") if isinstance(bot.get("config"), dict) else {}
+    config_snapshot = {
+        "min_confidence": cfg.get("min_confidence"),
+        "min_score": cfg.get("min_score"),
+        "block_elevated_vol": bool(cfg.get("block_elevated_vol")),
+        "calibration_gate_enabled": bool(cfg.get("calibration_gate_enabled")),
+    }
+
     return JSONResponse({
         "ok": True,
         "patch": patch,
         "applied": result.get("applied") or [],
         "message": result.get("message"),
-        "bot": detail,
+        "config_snapshot": config_snapshot,
+        "bot": bot,
+        "detail": detail,
     })
 
 
@@ -978,6 +1064,133 @@ async def _binding_handler(request: Request) -> JSONResponse:
     return JSONResponse(body, status_code=status)
 
 
+async def market_footprint_handler(request: Request) -> JSONResponse:
+    from app.services.archive.query import query_footprint_detailed
+
+    symbol = request.query_params.get("symbol")
+    if not symbol:
+        return JSONResponse({"ok": False, "error": "symbol is required"}, status_code=400)
+
+    try:
+        from_ts = int(request.query_params.get("from_ts", 0))
+        to_ts = int(request.query_params.get("to_ts", 0))
+        price_step = float(request.query_params.get("price_step", 0.0))
+        time_bucket_ms = int(request.query_params.get("time_bucket_ms", 60000))
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "invalid numeric parameters"}, status_code=400)
+
+    if price_step <= 0 or time_bucket_ms <= 0:
+        return JSONResponse(
+            {"ok": False, "error": "price_step and time_bucket_ms must be > 0"},
+            status_code=400,
+        )
+
+    import asyncio
+
+    try:
+        footprint, meta = await asyncio.to_thread(
+            query_footprint_detailed,
+            symbol.upper(),
+            from_ts,
+            to_ts,
+            price_step,
+            time_bucket_ms,
+        )
+        if meta.get("error"):
+            return JSONResponse(
+                {"ok": False, "error": meta["error"], "meta": meta},
+                status_code=500,
+            )
+        body: dict = {"ok": True, "footprint": footprint, "meta": meta}
+        if meta.get("range_note"):
+            body["message"] = meta["range_note"]
+        return JSONResponse(body)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def generate_daily_briefing_handler(request: Request) -> JSONResponse:
+    from app.services.agent.briefing import generate_daily_briefing
+    import asyncio
+    
+    state: AppState = request.app.state.terminal
+    
+    try:
+        result = await generate_daily_briefing(state)
+        if result.get("ok"):
+            return JSONResponse({
+                "ok": True,
+                "briefing": result.get("briefing"),
+                "stats": result.get("stats"),
+            })
+        else:
+            # Return 200 so the frontend handles it gracefully without a loud console error
+            return JSONResponse({"ok": False, "error": result.get("error", "Unknown error")})
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Briefing generation failed: {e}", exc_info=True)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+async def copilot_chat_handler(request: Request) -> JSONResponse:
+    from app.services.agent.copilot import handle_message
+    
+    state: AppState = request.app.state.terminal
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+        
+    result = await handle_message(
+        state,
+        message=body.get("message", ""),
+        session_id=body.get("session_id"),
+        active_symbol=body.get("active_symbol")
+    )
+    return JSONResponse(result.to_dict())
+
+async def copilot_confirm_handler(request: Request) -> JSONResponse:
+    from app.services.agent.copilot import confirm_action, cancel_action
+    
+    state: AppState = request.app.state.terminal
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+        
+    pending_id = body.get("pending_id")
+    if not pending_id:
+        return JSONResponse({"ok": False, "error": "Missing pending_id"}, status_code=400)
+        
+    if body.get("cancel"):
+        res = cancel_action(pending_id)
+    else:
+        res = await confirm_action(state, pending_id)
+        
+    return JSONResponse(res)
+
+async def copilot_history_handler(request: Request) -> JSONResponse:
+    from app.services.agent.copilot_store import list_messages
+    
+    session_id = request.query_params.get("session_id")
+    limit = request.query_params.get("limit", "40")
+    if not session_id:
+        return JSONResponse({"ok": False, "error": "Missing session_id"}, status_code=400)
+        
+    msgs = list_messages(session_id, limit=int(limit))
+    return JSONResponse({"ok": True, "messages": msgs})
+
+async def copilot_clear_handler(request: Request) -> JSONResponse:
+    from app.services.agent.copilot_store import clear_session
+    
+    session_id = request.path_params.get("session_id")
+    if not session_id:
+        return JSONResponse({"ok": False, "error": "Missing session_id"}, status_code=400)
+        
+    cleared = clear_session(session_id)
+    return JSONResponse({"ok": True, "cleared": cleared})
+
+
 def _make_endpoint(binding):
     async def endpoint(request: Request):
         request.scope["http_binding"] = binding
@@ -1023,6 +1236,12 @@ def create_http_app(state: AppState) -> Starlette:
         Route("/api/v1/workspaces", get_workspaces_handler, methods=["GET"]),
         Route("/api/v1/workspaces", save_workspace_handler, methods=["POST"]),
         Route("/api/v1/workspaces/{workspace_id}", delete_workspace_handler, methods=["DELETE"]),
+        Route("/api/v1/market/footprint", market_footprint_handler, methods=["GET"]),
+        Route("/api/v1/journal/briefing/generate", generate_daily_briefing_handler, methods=["POST"]),
+        Route("/api/v1/copilot/chat", copilot_chat_handler, methods=["POST"]),
+        Route("/api/v1/copilot/confirm", copilot_confirm_handler, methods=["POST"]),
+        Route("/api/v1/copilot/history", copilot_history_handler, methods=["GET"]),
+        Route("/api/v1/copilot/history/{session_id}", copilot_clear_handler, methods=["DELETE"]),
     ]
 
     seen: set[tuple[str, str]] = set()

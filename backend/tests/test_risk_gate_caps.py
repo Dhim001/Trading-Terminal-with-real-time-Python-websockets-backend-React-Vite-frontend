@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from app.config import MAX_ORDER_VALUE
-from app.services.bots.risk_gate import RiskGate
+from app.services.bots.risk_gate import RiskGate, get_bot_entry_hold
 
 
 class RiskGateNotionalCapTests(unittest.TestCase):
@@ -75,6 +75,116 @@ class RiskGateNotionalCapTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertAlmostEqual(decision.quantity, MAX_ORDER_VALUE / price, places=6)
         self.assertIn("MAX_ORDER_VALUE", decision.reason)
+
+
+class BotEntryHoldTests(unittest.TestCase):
+    # 2026-07-10T12:00:00Z — 120s after 11:58Z exit fixtures below
+    _NOW = 1_783_684_800.0
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=3)
+    @patch("app.services.bots.analytics.last_exit_timestamp", return_value="2026-07-10T11:58:00Z")
+    def test_cooloff_hold_payload(self, _last_exit, _streak):
+        bot = {
+            "id": "bot-cool",
+            "status": "RUNNING",
+            "config": {"loss_cooloff_sec": 300, "max_consecutive_losses": 5},
+        }
+        with patch("app.services.bots.risk_gate.time.time", return_value=self._NOW):
+            hold = get_bot_entry_hold(bot)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold["kind"], "cooloff")
+        self.assertGreater(hold["remaining_sec"], 0)
+        self.assertIn("cooloff_until", hold)
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=3)
+    @patch("app.services.bots.analytics.last_exit_timestamp", return_value="2026-07-10T11:58:00Z")
+    def test_cooloff_hold_while_paused(self, _last_exit, _streak):
+        bot = {
+            "id": "bot-paused-cool",
+            "status": "PAUSED",
+            "config": {"loss_cooloff_sec": 300, "max_consecutive_losses": 5},
+        }
+        with patch("app.services.bots.risk_gate.time.time", return_value=self._NOW):
+            hold = get_bot_entry_hold(bot)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold["kind"], "cooloff")
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=5)
+    @patch(
+        "app.services.bots.analytics.last_exit_timestamp",
+        return_value="2026-07-10T11:58:00Z",
+    )
+    def test_streak_limit_hold_payload(self, _last_exit, _streak):
+        bot = {
+            "id": "bot-streak",
+            "status": "PAUSED",
+            "config": {"max_consecutive_losses": 5, "loss_cooloff_sec": 300},
+        }
+        with patch("app.services.bots.risk_gate.time.time", return_value=self._NOW):
+            hold = get_bot_entry_hold(bot)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold["kind"], "streak_limit")
+        self.assertEqual(hold["consecutive_losses"], 5)
+        self.assertGreater(hold["remaining_sec"], 0)
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=5)
+    @patch(
+        "app.services.bots.analytics.last_exit_timestamp",
+        return_value="2026-07-10T11:00:00Z",
+    )
+    def test_streak_limit_clears_after_cooloff(self, _last_exit, _streak):
+        bot = {
+            "id": "bot-streak-expired",
+            "status": "RUNNING",
+            "config": {"max_consecutive_losses": 5, "loss_cooloff_sec": 300},
+        }
+        with patch("app.services.bots.risk_gate.time.time", return_value=self._NOW):
+            hold = get_bot_entry_hold(bot)
+        self.assertIsNone(hold)
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=5)
+    @patch(
+        "app.services.bots.analytics.last_exit_timestamp",
+        return_value="2026-07-10T11:58:00Z",
+    )
+    def test_streak_limit_cleared_by_resume_ack(self, _last_exit, _streak):
+        bot = {
+            "id": "bot-streak-ack",
+            "status": "RUNNING",
+            "config": {
+                "max_consecutive_losses": 5,
+                "loss_cooloff_sec": 300,
+                "streak_hold_cleared_at": self._NOW,
+            },
+        }
+        with patch("app.services.bots.risk_gate.time.time", return_value=self._NOW):
+            hold = get_bot_entry_hold(bot)
+        self.assertIsNone(hold)
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=0)
+    def test_drawdown_hold_payload(self, _streak):
+        bot = {
+            "id": "bot-dd",
+            "status": "PAUSED",
+            "allocation": 1000.0,
+            "config": {"max_drawdown_pct": 10.0},
+        }
+        hold = get_bot_entry_hold(bot, total_pnl=-150.0)
+        self.assertIsNotNone(hold)
+        self.assertEqual(hold["kind"], "drawdown")
+        self.assertAlmostEqual(hold["drawdown_pct"], 15.0)
+        self.assertEqual(hold["max_drawdown_pct"], 10.0)
+
+    @patch("app.services.bots.analytics.get_recent_consecutive_losses", return_value=0)
+    def test_drawdown_hold_skipped_when_under_limit(self, _streak):
+        bot = {
+            "id": "bot-ok",
+            "status": "RUNNING",
+            "allocation": 1000.0,
+            "config": {"max_drawdown_pct": 20.0},
+        }
+        hold = get_bot_entry_hold(bot, total_pnl=-50.0)
+        self.assertIsNone(hold)
 
 
 if __name__ == "__main__":

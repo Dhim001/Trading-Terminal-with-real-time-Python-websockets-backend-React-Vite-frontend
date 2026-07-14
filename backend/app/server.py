@@ -57,6 +57,9 @@ from app.services.bots.runtime import (
     risk_monitor_loop,
     bot_reconcile_loop,
     calibration_refresh_loop,
+    regime_rotation_loop,
+    alpha_decay_loop,
+    scanner_deploy_loop,
     runs_bar_publisher,
     runs_bot_engine_inline,
 )
@@ -377,6 +380,13 @@ async def websocket_handler(websocket):
             close_code = websocket.close_code
             close_reason = websocket.close_reason or ""
         record_ws_disconnect(close_code, close_reason)
+        try:
+            from app.services.bots.backtest_jobs import cancel_job, clear_job
+
+            cancel_job(websocket)
+            clear_job(websocket)
+        except Exception as exc:
+            logging.debug("WS disconnect backtest cleanup skipped: %s", exc)
         manager.unregister(websocket)
 
 
@@ -453,6 +463,11 @@ async def main():
         state.event_bus.subscribe(channels.WS_BROADCAST, on_ws_broadcast)
         await state.event_bus.start()
 
+    # Redis agent listener must start after the event loop is running
+    # (AgentEventBus.__init__ is sync and must not call create_task).
+    if state.agent_event_bus is not None and hasattr(state.agent_event_bus, "start"):
+        await state.agent_event_bus.start()
+
     await state.feed.start()
     await state.oms.initialize()
 
@@ -482,11 +497,13 @@ async def main():
             logging.info("WebSocket Server listening on ws://%s:%s", WS_HOST, WS_PORT)
             if HTTP_ENABLED:
                 logging.info("HTTP API enabled on http://%s:%s", HTTP_HOST, HTTP_PORT)
-
             tasks = [
                 asyncio.create_task(heartbeat_loop()),
                 asyncio.create_task(ws_keepalive_loop()),
             ]
+            
+
+
 
             if HTTP_ENABLED:
                 http_task = start_http_server(state, shutdown_event)
@@ -506,6 +523,13 @@ async def main():
                 tasks.append(asyncio.create_task(bot_snapshot_loop(state.bot_manager)))
                 tasks.append(asyncio.create_task(risk_monitor_loop(state.bot_manager)))
                 tasks.append(asyncio.create_task(calibration_refresh_loop()))
+                tasks.append(asyncio.create_task(regime_rotation_loop(state.bot_manager)))
+                tasks.append(asyncio.create_task(alpha_decay_loop(state.bot_manager)))
+                tasks.append(
+                    asyncio.create_task(
+                        scanner_deploy_loop(state.bot_manager, backtester=state.backtester, agent_event_bus=state.agent_event_bus)
+                    )
+                )
                 if not uses_paper_oms():
                     tasks.append(asyncio.create_task(bot_reconcile_loop(state.bot_manager)))
             elif runs_bar_publisher():
@@ -582,6 +606,7 @@ async def main():
             oms=state.oms,
             feed=state.feed,
             event_bus=state.event_bus,
+            agent_event_bus=state.agent_event_bus,
         )
 
 
@@ -592,6 +617,7 @@ async def _shutdown() -> None:
         oms=state.oms,
         feed=state.feed,
         event_bus=state.event_bus,
+        agent_event_bus=state.agent_event_bus,
     )
 
 

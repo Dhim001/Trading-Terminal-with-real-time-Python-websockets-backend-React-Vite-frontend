@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import logging
 import json
 import uuid
@@ -23,7 +24,7 @@ from app.services.bots.bar_events import BarCloseTracker
 from app.services.agent.bar_time import coerce_bar_time
 from app.services.bots.candle_source import candles_for_timeframe, get_bot_candles
 from app.services.market.timeframes import is_valid_timeframe, normalize_timeframe
-from app.services.bots.risk_gate import RiskGate
+from app.services.bots.risk_gate import RiskGate, get_bot_entry_hold
 from app.services.bots.risk_sizing import RISK_PCT
 from app.services.bots import analytics as bot_analytics
 from app.services.bots import positions as bot_positions
@@ -123,11 +124,18 @@ def _strategy_runtime_config(bot_id: str, bot: dict) -> dict:
 
 
 class BotManagerService:
-    def __init__(self, oms_service, screener_service, broadcast_cb):
+    def __init__(
+        self,
+        oms,
+        screener,
+        broadcast_cb=None,
+        agent_event_bus=None,
+    ) -> None:
         self.logger = logging.getLogger(__name__)
-        self.oms = oms_service
-        self.screener = screener_service
+        self.oms = oms
+        self.screener = screener
         self.broadcast_cb = broadcast_cb
+        self.agent_event_bus = agent_event_bus
         self.active_bots = {}
         self._bar_tracker = BarCloseTracker()
         self._risk_gate = RiskGate()
@@ -135,6 +143,10 @@ class BotManagerService:
         self._log_buffer: list[tuple[str, str, str]] = []
         self._log_flush_task = None
         self._tick_screener = TickScreener()
+
+        from app.services.bots.pretrade_intel import PreTradeIntel
+
+        self._pretrade_intel = PreTradeIntel(self, agent_event_bus=self.agent_event_bus)
 
     def _get_daily_pnl(self, bot_id: str) -> float:
         return bot_analytics.get_daily_pnl(bot_id)
@@ -191,6 +203,8 @@ class BotManagerService:
             else:
                 self.active_bots[bot_id]["strategy_instance"] = get_strategy(strategy, runtime_config)
                 self.active_bots[bot_id]["tick_strategy_instance"] = None
+            if "signal_history" not in self.active_bots[bot_id]:
+                self.active_bots[bot_id]["signal_history"] = deque(maxlen=20)
         stale_ids = [bot_id for bot_id in self.active_bots if bot_id not in loaded_ids]
         for bot_id in stale_ids:
             del self.active_bots[bot_id]
@@ -433,6 +447,9 @@ class BotManagerService:
             "trades": bot_analytics.get_trades(bot_id, 50),
             "snapshots": bot_analytics.get_snapshots(bot_id, 30),
             "consecutive_losses": bot_analytics.get_recent_consecutive_losses(bot_id),
+            "risk_hold": get_bot_entry_hold(
+                {**bot, "total_pnl": float(stats.get("total_pnl") or 0)},
+            ),
             "model_staleness": self._get_model_staleness(bot_id),
         }
 
@@ -530,6 +547,54 @@ class BotManagerService:
     async def _halt_bot(self, bot_id: str, reason: str):
         await self._set_bot_status(bot_id, "ERROR")
         await self.log_bot_event(bot_id, "ERROR", reason)
+
+    async def _maybe_auto_pause_on_entry_hold(self, bot_id: str) -> bool:
+        """Pause immediately when a trade pushes the bot into streak or drawdown hold.
+
+        Returns True if the bot was paused.
+        """
+        bot = self.active_bots.get(bot_id)
+        if not bot or bot.get("status") != "RUNNING":
+            return False
+        stats = bot_analytics.get_bot_stats(bot_id)
+        hold = get_bot_entry_hold(
+            {**bot, "total_pnl": float(stats.get("total_pnl") or 0)},
+        )
+        if not hold or hold.get("kind") not in ("streak_limit", "drawdown"):
+            return False
+        cfg = bot.get("config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg) if cfg else {}
+            except json.JSONDecodeError:
+                cfg = {}
+        # Scanner auto-deploy bots: hard-stop on drawdown (proposal Agent 6).
+        if (
+            hold["kind"] == "drawdown"
+            and cfg.get("pipeline_source") in ("scanner_auto", "scanner")
+        ):
+            await self.stop_bot(bot_id)
+            await self.log_bot_event(
+                bot_id,
+                "WARN",
+                f"Scanner Auto-Deploy stopped at max drawdown — "
+                f"{hold.get('block_reason') or hold.get('reason')}",
+            )
+            return True
+        await self._set_bot_status(bot_id, "PAUSED")
+        if hold["kind"] == "drawdown":
+            await self.log_bot_event(
+                bot_id,
+                "WARN",
+                f"Auto-paused at max drawdown — {hold.get('block_reason') or hold.get('reason')}",
+            )
+        else:
+            await self.log_bot_event(
+                bot_id,
+                "WARN",
+                f"Auto-paused after loss streak — {hold.get('block_reason') or hold.get('reason')}",
+            )
+        return True
 
     async def process_market_tick(self, symbol: str, ohlcv_1m: list | None = None, *, feed=None):
         try:
@@ -797,11 +862,41 @@ class BotManagerService:
                 pos_size = float(bot_pos.get("size") or 0.0)
                 eval_row["_current_side"] = "BUY" if pos_size > 0 else ("SELL" if pos_size < 0 else "NONE")
 
-                signal_data = strat.evaluate(eval_row)
-                signal = signal_data.get("signal")
+                # ── Time Stop Check ──
+                # opened_at and candle bar_time are both unix seconds; do not mix with ms.
+                signal = None
+                signal_data = {}
+                time_stop_bars = int((bot_config or {}).get("time_stop_bars") or 0)
+                if pos_size != 0 and time_stop_bars > 0:
+                    from app.services.bots.position_duration import bars_held_since_open
+
+                    bars_elapsed = bars_held_since_open(
+                        bot_pos.get("opened_at"),
+                        bar_time,
+                        timeframe,
+                    )
+                    if bars_elapsed is not None and bars_elapsed >= time_stop_bars:
+                        signal = "CLOSE"
+                        signal_data = {
+                            "signal": "CLOSE",
+                            "reasons": [f"Time stop reached ({time_stop_bars} bars)"],
+                        }
+                        await self.log_bot_event(
+                            bot_id,
+                            "INFO",
+                            f"Time stop reached ({time_stop_bars} bars), forcing CLOSE",
+                        )
+
+                if not signal:
+                    signal_data = strat.evaluate(eval_row)
+                    signal = signal_data.get("signal")
                 if strat_key == "CHART_AGENT" and signal not in ("BUY", "SELL", "CLOSE"):
                     reject = signal_data.get("reject_reason")
                     if reject:
+                        from app.services.bots.strategies_chart_agent import classify_filter_reject
+                        bucket = classify_filter_reject(reject)
+                        if bucket and bucket != "other":
+                            bot.setdefault("signal_history", deque(maxlen=20)).append(False)
                         inc("bot_orders_blocked_total", labels={"strategy": "CHART_AGENT", "reason": "filter"})
                         await self.log_bot_event(
                             bot_id,
@@ -826,6 +921,7 @@ class BotManagerService:
                 if confirm_tf and signal in ("BUY", "SELL"):
                     htf_bias = await self._get_htf_bias(symbol, confirm_tf)
                     if signal == "BUY" and htf_bias == "BEAR":
+                        bot.setdefault("signal_history", deque(maxlen=20)).append(False)
                         inc("bot_orders_blocked_total", labels={"strategy": strat_key, "reason": "htf_gate"})
                         await self.log_bot_event(
                             bot_id, "WARN",
@@ -833,6 +929,7 @@ class BotManagerService:
                         )
                         continue
                     if signal == "SELL" and htf_bias == "BULL":
+                        bot.setdefault("signal_history", deque(maxlen=20)).append(False)
                         inc("bot_orders_blocked_total", labels={"strategy": strat_key, "reason": "htf_gate"})
                         await self.log_bot_event(
                             bot_id, "WARN",
@@ -845,6 +942,7 @@ class BotManagerService:
                 if strat_filter and signal in ("BUY", "SELL"):
                     allowed, reason = strat_filter.evaluate_gate(eval_row, signal)
                     if not allowed:
+                        bot.setdefault("signal_history", deque(maxlen=20)).append(False)
                         inc("bot_orders_blocked_total", labels={"strategy": strat_key, "reason": "filter_gate"})
                         await self.log_bot_event(
                             bot_id, "WARN",
@@ -860,6 +958,7 @@ class BotManagerService:
                         symbol, bar_time, bot_config, is_exit=False,
                     )
                     if not gate_ok and gate_reason:
+                        bot.setdefault("signal_history", deque(maxlen=20)).append(False)
                         inc(
                             "bot_orders_blocked_total",
                             labels={"strategy": strat_key, "reason": gate_kind or "event"},
@@ -950,8 +1049,32 @@ class BotManagerService:
             if ctx is None:
                 continue
 
-            signal_data = strat.evaluate(ctx, price)
-            signal = signal_data.get("signal")
+            bot_pos = self._get_bot_position(bot_id, symbol)
+            pos_size = float(bot_pos.get("size") or 0.0)
+            
+            # opened_at is unix seconds; tick clock is milliseconds.
+            signal = None
+            signal_data = {}
+            time_stop_sec = int(cfg.get("time_stop_sec", 0))
+            if pos_size != 0 and time_stop_sec > 0:
+                from app.services.bots.position_duration import seconds_held_since_open
+
+                elapsed_sec = seconds_held_since_open(bot_pos.get("opened_at"), time_ms)
+                if elapsed_sec is not None and elapsed_sec >= time_stop_sec:
+                    signal = "CLOSE"
+                    signal_data = {
+                        "signal": "CLOSE",
+                        "reasons": [f"Time stop reached ({time_stop_sec}s)"],
+                    }
+                    await self.log_bot_event(
+                        bot_id,
+                        "INFO",
+                        f"Time stop reached ({time_stop_sec}s), forcing CLOSE",
+                    )
+
+            if not signal:
+                signal_data = strat.evaluate(ctx, price)
+                signal = signal_data.get("signal")
             if signal not in ("BUY", "SELL", "CLOSE"):
                 continue
 
@@ -1039,6 +1162,17 @@ class BotManagerService:
         inc("bot_signals_total", labels={"strategy": strat_key, "signal": signal_kind})
 
         if not is_exit:
+            # --- Pre-Trade Intelligence Gating ---
+            verdict = await self._pretrade_intel.evaluate(bot, side, current_price, signal_data, bar_time)
+            
+            if verdict.get("verdict") == "VETO":
+                signal_ledger.release_signal(signal_id)
+                reason = f"Pre-Trade Intel VETO: {verdict.get('reasoning')}"
+                await self.log_bot_event(bot_id, "WARN", reason)
+                _record_order_blocked(bot, reason)
+                bot.setdefault("signal_history", deque(maxlen=20)).append(False)
+                return
+
             account_balance = self.get_account_balance()
             risk_amount = account_balance * RISK_PCT
 
@@ -1072,6 +1206,10 @@ class BotManagerService:
                 conf_scale = max(0.5, min(1.5, conf_scale))
                 quantity *= conf_scale
 
+            if verdict.get("verdict") == "REDUCE_SIZE":
+                size_mult = float(verdict.get("size_multiplier") or 0.5)
+                quantity *= size_mult
+
             if bot_cfg.get("use_meta_label_sizing"):
                 snap = signal_data.get("insight_snapshot") or {
                     "score": signal_data.get("score"),
@@ -1093,9 +1231,47 @@ class BotManagerService:
                     ml_scale = max(0.5, min(1.5, ml_scale))
                     quantity *= ml_scale
 
+            # 3.4-A: Regime-Adaptive Sizing (Kelly scaling during drawdowns)
+            if bot_cfg.get("use_regime_sizing", True):
+                from app.services.bots.positions import get_recent_closed_trades_pnl
+                recent_pnls = get_recent_closed_trades_pnl(bot_id, limit=3)
+                if len(recent_pnls) == 3 and all(pnl < 0 for pnl in recent_pnls):
+                    quantity *= 0.5
+                    await self.log_bot_event(bot_id, "INFO", "Bot in drawdown (3 consecutive losses). Halving allocation size.")
+
+            # Agent 4: Pre-Trade Intelligence — holistic last-mile entry filter.
+            pt = await self._pretrade_intel.evaluate(
+                bot,
+                side,
+                current_price,
+                signal_data,
+                bar_time=signal_data.get("time"),
+            )
+            verdict = pt.get("verdict")
+            reasoning = pt.get("reasoning")
+            reasoning_chain = pt.get("reasoning_chain")
+
+            if verdict == "VETO":
+                bot.setdefault("signal_history", deque(maxlen=20)).append(False)
+                signal_ledger.release_signal(signal_id)
+                await self.log_bot_event(bot_id, "WARN", f"Pre-trade veto: {reasoning}", meta={"reasoning_chain": reasoning_chain})
+                _record_order_blocked(bot, f"Pre-trade veto: {reasoning}")
+                return
+            if verdict == "REDUCE_SIZE" and pt.get("size_multiplier", 1.0) < 1.0:
+                size_factor = pt.get("size_multiplier", 1.0)
+                quantity *= size_factor
+                await self.log_bot_event(
+                    bot_id,
+                    "INFO",
+                    f"Pre-trade reduce ×{size_factor:.2f}: {reasoning}",
+                    meta={"reasoning_chain": reasoning_chain}
+                )
+
         pos_size = self._get_bot_position_size(bot_id, symbol)
+        risk_stats = bot_analytics.get_bot_stats(bot_id)
+        bot_for_risk = {**bot, "total_pnl": float(risk_stats.get("total_pnl") or 0)}
         decision = self._risk_gate.validate_trade(
-            bot,
+            bot_for_risk,
             side,
             quantity,
             current_price,
@@ -1105,11 +1281,36 @@ class BotManagerService:
         )
 
         if not decision.allowed:
+            if not is_exit:
+                bot.setdefault("signal_history", deque(maxlen=20)).append(False)
             signal_ledger.release_signal(signal_id)
             await self.log_bot_event(bot_id, "WARN", f"Risk blocked: {decision.reason}")
             _record_order_blocked(bot, decision.reason)
             if "Daily loss limit" in decision.reason:
                 await self._halt_bot(bot_id, decision.reason)
+            elif bot.get("status") == "RUNNING" and (
+                "Consecutive-loss streak" in decision.reason
+                or "Max drawdown circuit breaker" in decision.reason
+            ):
+                await self._set_bot_status(bot_id, "PAUSED")
+                if "Max drawdown circuit breaker" in decision.reason:
+                    await self.log_bot_event(
+                        bot_id,
+                        "WARN",
+                        f"Auto-paused at max drawdown — {decision.reason}",
+                    )
+                else:
+                    await self.log_bot_event(
+                        bot_id,
+                        "WARN",
+                        f"Auto-paused after loss streak — {decision.reason}",
+                    )
+            if (
+                "Consecutive-loss streak" in decision.reason
+                or "Cooling-off" in decision.reason
+                or "Max drawdown circuit breaker" in decision.reason
+            ):
+                await publish_bots_update(self.broadcast_cb, self.list_bots_public())
             return
 
         quantity = decision.quantity if decision.quantity is not None else quantity
@@ -1235,10 +1436,28 @@ class BotManagerService:
                 },
             )
 
+        # Snapshot excursion marks before the exit fill clears the position.
+        exit_excursion: dict = {}
+        if is_exit:
+            try:
+                pos = bot_positions.get_bot_position(bot_id, symbol)
+                if pos:
+                    exit_excursion = {
+                        "high_watermark": pos.get("high_watermark"),
+                        "low_watermark": pos.get("low_watermark"),
+                        "entry_atr": pos.get("entry_atr"),
+                        "avg_price": pos.get("avg_price"),
+                        "size": pos.get("size"),
+                    }
+            except Exception:
+                pass
+
         try:
             result = await self.oms.place_order(order_req)
 
             if result.get("status") == "success":
+                if not is_exit:
+                    bot.setdefault("signal_history", deque(maxlen=20)).append(True)
                 if bar_time is not None:
                     bot["last_signal_bar_time"] = bar_time
                 order_id = result.get("order_id")
@@ -1318,6 +1537,21 @@ class BotManagerService:
                                     )
                         except Exception:
                             pass
+                        await self._maybe_auto_pause_on_entry_hold(bot_id)
+                        await self._run_posttrade_learner(
+                            bot_id,
+                            symbol=symbol,
+                            exit_side=side,
+                            exit_price=fill_price,
+                            entry_price=entry_price or exit_excursion.get("avg_price"),
+                            quantity=filled_qty,
+                            pnl=trade_pnl,
+                            trigger_type="SIGNAL",
+                            high_watermark=exit_excursion.get("high_watermark"),
+                            low_watermark=exit_excursion.get("low_watermark"),
+                            entry_insight=insight_snapshot or signal_data.get("insight_snapshot"),
+                            order_id=order_id,
+                        )
                     self.record_snapshot_for_bot(bot_id)
                     signal_ledger.mark_signal_filled(signal_id, order_id=order_id)
 
@@ -1442,6 +1676,7 @@ class BotManagerService:
             "last_signal_bar_time": None,
             "last_signal_at": None,
             "last_tick_signal_at": 0,
+            "signal_history": deque(maxlen=20),
         }
         if mode == "TICK":
             self.active_bots[bot_id]["tick_strategy_instance"] = get_tick_strategy(
@@ -1474,8 +1709,18 @@ class BotManagerService:
         bot = self.active_bots[bot_id]
         if bot.get("status") == "ERROR":
             raise ValueError("Bot is in ERROR state — stop and redeploy.")
+        # Acknowledge losses through now so streak/cooloff holds do not
+        # immediately re-block entries (resume used to be a no-op for gating).
+        await self.update_bot_config(
+            bot_id,
+            {"streak_hold_cleared_at": time.time()},
+        )
         await self._set_bot_status(bot_id, "RUNNING")
-        await self.log_bot_event(bot_id, "INFO", "Bot resumed.")
+        await self.log_bot_event(
+            bot_id,
+            "INFO",
+            "Bot resumed — loss-streak entry hold cleared until the next exit.",
+        )
 
     async def stop_bot(self, bot_id: str):
         if bot_id in self.active_bots:
@@ -1616,6 +1861,31 @@ class BotManagerService:
             await self.stop_bot(bot_id)
         return len(all_ids)
 
+    def _public_bot_row(self, bot: dict, stats: dict) -> dict:
+        bot_id = bot["id"]
+        total_pnl = float(stats.get("total_pnl") or 0)
+        streak = bot_analytics.get_recent_consecutive_losses(bot_id)
+        row = {
+            "id": bot_id,
+            "strategy": bot["strategy"],
+            "symbol": bot["symbol"],
+            "timeframe": bot["timeframe"],
+            "status": bot["status"],
+            "allocation": bot["allocation"],
+            "config": bot.get("config", {}),
+            "execution_mode": bot.get("execution_mode", "BAR_CLOSE"),
+            "daily_pnl": stats["daily_pnl"],
+            "total_pnl": total_pnl,
+            "trade_count": stats["trade_count"],
+            "win_rate": stats["win_rate"],
+            "last_signal_at": bot.get("last_signal_at"),
+            "consecutive_losses": streak,
+        }
+        hold = get_bot_entry_hold({**bot, "total_pnl": total_pnl})
+        if hold:
+            row["risk_hold"] = hold
+        return row
+
     def list_bots_public(self) -> list:
         bot_ids = [bot["id"] for bot in self.active_bots.values()]
         stats_map = bot_analytics.get_all_bot_stats(bot_ids)
@@ -1623,21 +1893,7 @@ class BotManagerService:
         for bot in self.active_bots.values():
             bot_id = bot["id"]
             stats = stats_map.get(bot_id, bot_analytics.get_bot_stats(bot_id))
-            out.append({
-                "id": bot_id,
-                "strategy": bot["strategy"],
-                "symbol": bot["symbol"],
-                "timeframe": bot["timeframe"],
-                "status": bot["status"],
-                "allocation": bot["allocation"],
-                "config": bot.get("config", {}),
-                "execution_mode": bot.get("execution_mode", "BAR_CLOSE"),
-                "daily_pnl": stats["daily_pnl"],
-                "total_pnl": stats["total_pnl"],
-                "trade_count": stats["trade_count"],
-                "win_rate": stats["win_rate"],
-                "last_signal_at": bot.get("last_signal_at"),
-            })
+            out.append(self._public_bot_row(bot, stats))
         return out
 
     def list_all_bots_public(self, limit: int = 100) -> list:
@@ -1666,24 +1922,49 @@ class BotManagerService:
                     "config": json.loads(row.get("config") or "{}"),
                 }
             stats = stats_map.get(bot_id, bot_analytics.get_bot_stats(bot_id))
-            out.append({
-                "id": bot_id,
-                "strategy": bot["strategy"],
-                "symbol": bot["symbol"],
-                "timeframe": bot["timeframe"],
-                "status": bot["status"],
-                "allocation": bot["allocation"],
-                "config": bot.get("config", {}),
-                "execution_mode": bot.get("execution_mode") or row.get("execution_mode", "BAR_CLOSE"),
-                "daily_pnl": stats["daily_pnl"],
-                "total_pnl": stats["total_pnl"],
-                "trade_count": stats["trade_count"],
-                "win_rate": stats["win_rate"],
-                "exit_count": stats["exit_count"],
-                "created_at": row.get("created_at"),
-                "last_signal_at": bot.get("last_signal_at"),
-            })
+            public = self._public_bot_row(bot, stats)
+            public["exit_count"] = stats.get("exit_count")
+            public["created_at"] = row.get("created_at")
+            out.append(public)
         return out
+
+    async def _run_posttrade_learner(
+        self,
+        bot_id: str,
+        *,
+        symbol: str,
+        exit_side: str,
+        exit_price: float,
+        entry_price: float | None,
+        quantity: float,
+        pnl: float | None,
+        trigger_type: str | None = None,
+        high_watermark: float | None = None,
+        low_watermark: float | None = None,
+        entry_insight: dict | None = None,
+        order_id: str | None = None,
+    ) -> None:
+        """Agent 5: classify closed trade and optionally apply lessons."""
+        try:
+            from app.services.bots.posttrade_learner import learn_from_closed_trade
+
+            await learn_from_closed_trade(
+                self,
+                bot_id,
+                symbol=symbol,
+                exit_side=exit_side,
+                exit_price=exit_price,
+                entry_price=entry_price,
+                quantity=quantity,
+                pnl=pnl,
+                trigger_type=trigger_type,
+                high_watermark=high_watermark,
+                low_watermark=low_watermark,
+                entry_insight=entry_insight,
+                order_id=order_id,
+            )
+        except Exception as exc:
+            logger.debug("posttrade learner skipped for %s: %s", bot_id, exc)
 
     async def handle_sl_tp_exits(self, bot_exits: list[dict]):
         """Record SIM stop-loss / take-profit exits in bot analytics."""
@@ -1735,6 +2016,20 @@ class BotManagerService:
                 bot_id,
                 "INFO",
                 f"{trigger} exit {side} {qty:.4f} @ {price:.4f} (PnL {trade_pnl:+.2f}).",
+            )
+            await self._maybe_auto_pause_on_entry_hold(bot_id)
+            await self._run_posttrade_learner(
+                bot_id,
+                symbol=exit_info["symbol"],
+                exit_side=side,
+                exit_price=price,
+                entry_price=entry_price,
+                quantity=qty,
+                pnl=trade_pnl,
+                trigger_type=str(trigger),
+                high_watermark=exit_info.get("high_watermark"),
+                low_watermark=exit_info.get("low_watermark"),
+                order_id=exit_info.get("order_id"),
             )
 
         await publish_post_trade_bundle(
@@ -1835,6 +2130,19 @@ class BotManagerService:
                 "SUCCESS",
                 f"Broker confirmed {p['side']} {filled_qty:.4f} @ {fill_price:.4f} (order {resolved_order_id}).",
             )
+            if is_exit:
+                await self._run_posttrade_learner(
+                    p["bot_id"],
+                    symbol=p["symbol"],
+                    exit_side=p["side"],
+                    exit_price=fill_price,
+                    entry_price=float(entry_price) if entry_price is not None else None,
+                    quantity=filled_qty,
+                    pnl=trade_pnl,
+                    trigger_type="BROKER",
+                    entry_insight=p.get("insight_snapshot") if isinstance(p.get("insight_snapshot"), dict) else None,
+                    order_id=resolved_order_id,
+                )
 
         if confirmed:
             for bot_id in touched:

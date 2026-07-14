@@ -1,8 +1,9 @@
-import React, { useState, useCallback, useEffect, useRef, Suspense, lazy } from 'react';
+import React, { useState, useCallback, useEffect, useRef, Suspense } from 'react';
 import { useStore } from './store/useStore';
 import { useSettingsStore } from './store/useSettingsStore';
 import { useWebSocket } from './hooks/useWebSocket';
 import { useBootstrap } from './hooks/useBootstrap';
+import { lazyImport } from './lib/lazyImport';
 
 import ResizableWatchlistSidebar from './components/ResizableWatchlistSidebar';
 import SettingsBootstrap     from './components/SettingsBootstrap';
@@ -21,17 +22,18 @@ import { useAlertMonitor } from './hooks/useAlertMonitor';
 import { applyLayoutMode } from './settings/layoutModes';
 import MemoryDevBadge from './components/MemoryDevBadge';
 import PwaInstallBanner from './components/PwaInstallBanner';
+import WorkspaceGrid from './components/WorkspaceGrid';
 
-const ChartWidget = lazy(() => import('./components/ChartWidget'));
-const MultiChartGrid = lazy(() => import('./components/MultiChartGrid'));
-const SystemControlPanel = lazy(() => import('./components/SystemControlPanel'));
-const SettingsPanel = lazy(() => import('./components/SettingsPanel'));
-const InsightsHub = lazy(() => import('./components/InsightsHub'));
-const AutomationStudio = lazy(() => import('./components/AutomationStudio'));
-const PortfolioDashboard = lazy(() => import('./components/PortfolioDashboard'));
-const BotDetailDrawer = lazy(() => import('./components/BotDetailDrawer'));
-const TradingPanel = lazy(() => import('./components/TradingPanel'));
-const ResizableDock = lazy(() => import('./components/ResizableDock'));
+const ChartWidget = lazyImport(() => import('./components/ChartWidget'), 'chart');
+const MultiChartGrid = lazyImport(() => import('./components/MultiChartGrid'), 'multi-chart');
+const SystemControlPanel = lazyImport(() => import('./components/SystemControlPanel'), 'system-control');
+const SettingsPanel = lazyImport(() => import('./components/SettingsPanel'), 'settings');
+const InsightsHub = lazyImport(() => import('./components/InsightsHub'), 'insights');
+const AutomationStudio = lazyImport(() => import('./components/AutomationStudio'), 'automation');
+const PortfolioDashboard = lazyImport(() => import('./components/PortfolioDashboard'), 'portfolio');
+const BotDetailDrawer = lazyImport(() => import('./components/BotDetailDrawer'), 'bot-detail');
+const TradingPanel = lazyImport(() => import('./components/TradingPanel'), 'trading');
+const ResizableDock = lazyImport(() => import('./components/ResizableDock'), 'dock');
 
 function PanelFallback({ label = 'Loading…' }) {
   return (
@@ -49,7 +51,7 @@ import { cn } from '@/lib/utils';
 import { brokerLabel } from '@/lib/operator';
 import {
   TrendingUp, LayoutGrid, BarChart2, SlidersHorizontal, Search, OctagonX,
-  CircleHelp, Bell, Activity, RefreshCw,
+  CircleHelp, Bell, Activity, RefreshCw, Briefcase,
 } from 'lucide-react';
 import { refreshFrontend } from './lib/refreshFrontend';
 import { sendAction } from './api/transport';
@@ -308,7 +310,7 @@ export default function App() {
 
   return (
     <div
-      className="dashboard-container"
+      className="flex flex-col h-screen w-screen bg-background overflow-hidden"
       data-sidebar-user=""
       data-layout-mode={layoutMode}
       data-zen={zenMode ? '' : undefined}
@@ -482,6 +484,22 @@ export default function App() {
                 <Button
                   variant="ghost"
                   size="icon-sm"
+                  onClick={() => setPortfolioOpen(true)}
+                  className="header-icon-btn text-muted-foreground hover:text-trading-accent"
+                  title="Portfolio Dashboard"
+                >
+                  <Briefcase aria-hidden />
+                  <span className="sr-only">Portfolio</span>
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Portfolio Dashboard</TooltipContent>
+            </Tooltip>
+
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
                   onClick={() => setActivityOpen(true)}
                   className="header-icon-btn text-muted-foreground hover:text-trading-accent"
                   title="Activity center"
@@ -638,38 +656,13 @@ export default function App() {
         </ErrorBoundary>
       )}
 
-      <ErrorBoundary name="Watchlist">
-        <ResizableWatchlistSidebar onLayoutChange={handleSidebarLayout} />
-      </ErrorBoundary>
-
-      <main id="main-chart" tabIndex={-1} className="workspace-main workspace-main--with-context">
-        {viewMode === 'single' ? (
-          <ErrorBoundary name="Chart">
-            <Suspense fallback={<PanelFallback label="Loading chart…" />}>
-              <ChartWidget />
-            </Suspense>
-          </ErrorBoundary>
-        ) : (
-          <ErrorBoundary name="Multi-chart grid">
-            <Suspense fallback={<PanelFallback label="Loading charts…" />}>
-              <MultiChartGrid onSwitchToSingle={() => setViewMode('single')} />
-            </Suspense>
-          </ErrorBoundary>
-        )}
-        {!zenMode && <ChartContextStrip />}
+      <main
+        className={cn('terminal-workspace', zenMode && 'terminal-workspace--zen', 'flex flex-col flex-1 h-full w-full overflow-hidden relative')}
+        onClick={() => setPaletteOpen(false)}
+        style={{ gridColumn: '1 / -1', gridRow: '3 / -1' }}
+      >
+        <WorkspaceGrid key="v5-layout" viewMode={viewMode} />
       </main>
-
-      <Suspense fallback={null}>
-        <TradingPanel hidden={!panelEnabled} />
-      </Suspense>
-
-      {showDock && (
-        <ErrorBoundary name="Trading dock">
-          <Suspense fallback={<PanelFallback label="Loading dock…" />}>
-            <ResizableDock setDockHeight={handleDockHeightChange} initialDockHeight={dockHeight} />
-          </Suspense>
-        </ErrorBoundary>
-      )}
       <MemoryDevBadge />
       <PwaInstallBanner />
     </div>

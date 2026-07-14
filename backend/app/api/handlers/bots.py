@@ -355,6 +355,24 @@ async def _execute_backtest(
             await _finish("cancelled")
             return
 
+        # Long-horizon runs must not silently proceed on a short local archive.
+        from app.config import ARCHIVE_RETENTION_1M_DAYS
+
+        replayed = float((meta or {}).get("replayed_days") or 0.0)
+        bar_count_resolve = len(candles or [])
+        if days > int(ARCHIVE_RETENTION_1M_DAYS) and replayed < days * 0.5:
+            note = (meta or {}).get("range_note") or (meta or {}).get("resolution_note") or ""
+            await _finish(
+                "error",
+                message=(
+                    f"Not enough history for {days}d {timeframe} backtest "
+                    f"(got ≈{replayed:.1f}d, {bar_count_resolve} bars). "
+                    f"Broker REST fill may have failed — check MASSIVE_API_KEY and recycle the backend. "
+                    f"{note}".strip()
+                ),
+            )
+            return
+
         # Multi-symbol portfolio backtest (no sweep / walk-forward)
         if portfolio_symbols and len(portfolio_symbols) > 1 and not sweep and not walk_forward:
             from app.services.bots.backtest_portfolio import (
@@ -1536,7 +1554,30 @@ async def run_backtest_sweep(ctx: RequestContext) -> None:
     req["sweep"] = sweep
     if await _maybe_defer_backtest(ctx, req):
         return
-    await _execute_backtest(ctx, **req)
+
+    # Use RQ for sweeps if possible to decouple from main loop
+    import os
+    redis_url = os.environ.get("REDIS_URL", "").strip()
+    if redis_url:
+        from redis import Redis
+        from rq import Queue
+        from app.services.bots.backtest_rq import run_backtest_job_rq
+        
+        # We must assign a job_id before enqueueing so we can subscribe to its progress
+        job_id = create_backtest_job(
+            req,
+            status="running",
+            client_key=str(id(ctx.websocket)) if ctx.websocket else None,
+        )
+        # Notify UI immediately that it's running via RQ
+        from app.api.outbound import send_order_result
+        await send_order_result(ctx, {"status": "success", "message": "Backtest sweep queued to RQ", "job_id": job_id})
+        
+        req["job_id"] = job_id
+        q = Queue("backtest", connection=Redis.from_url(redis_url))
+        q.enqueue(run_backtest_job_rq, req, job_timeout=3600)
+    else:
+        await _execute_backtest(ctx, **req)
 
 
 @route(Action.CANCEL_BACKTEST, tags=["bots"])

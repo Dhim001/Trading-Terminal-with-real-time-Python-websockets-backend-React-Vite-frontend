@@ -11,12 +11,12 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from app.config import DB_PATH
+from app.config import DB_PATH, DATABASE_URL
 
 logger = logging.getLogger(__name__)
 
 DB_DRIVER = "sqlite"
-_DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+_DATABASE_URL = DATABASE_URL
 _POOL_MAX = int(os.environ.get("DB_POOL_SIZE", "10"))
 _POOL_MIN = int(os.environ.get("DB_POOL_MIN", "1"))
 _POOL_TIMEOUT = float(os.environ.get("DB_POOL_TIMEOUT", "30"))
@@ -42,6 +42,17 @@ def _inc_lock_retries(n: int = 1) -> None:
 def lock_retry_total() -> int:
     with _stats_lock:
         return _lock_retry_total
+
+
+def _lock_retry_backoff_sec(attempt: int) -> float:
+    """Exponential delay between wrapper-level retries (attempt is 0-based)."""
+    return _LOCK_RETRY_BASE_SEC * (2 ** attempt)
+
+
+def _pause_before_lock_retry(attempt: int) -> None:
+    """Backoff between execute attempts after busy_timeout is exhausted."""
+    _inc_lock_retries()
+    time.sleep(_lock_retry_backoff_sec(attempt))
 
 
 def configure_sqlite_connection(conn: sqlite3.Connection) -> None:
@@ -87,17 +98,16 @@ class _CursorWrapper:
             except sqlite3.OperationalError as exc:
                 if not _is_sqlite_locked(exc) or attempt >= max_attempts - 1:
                     raise
-                _inc_lock_retries()
-                # PRAGMA busy_timeout already blocks inside SQLite — avoid stacking
-                # time.sleep() on the asyncio event loop during lock storms.
+                # busy_timeout blocks inside each attempt; backoff between attempts
+                # avoids a tight CPU loop if the pragma is misconfigured or expires.
+                _pause_before_lock_retry(attempt)
                 continue
             except Exception as exc:
                 if DB_DRIVER != "postgres" or not _is_transient_postgres_error(exc):
                     raise
                 if attempt >= max_attempts - 1:
                     raise
-                _inc_lock_retries()
-                time.sleep(_LOCK_RETRY_BASE_SEC * (2 ** attempt))
+                _pause_before_lock_retry(attempt)
         return None
 
     def executemany(self, sql: str, params_seq):
@@ -105,6 +115,11 @@ class _CursorWrapper:
 
     def fetchone(self):
         return self._cursor.fetchone()
+
+    def fetchmany(self, size: int | None = None):
+        if size is None:
+            return self._cursor.fetchmany()
+        return self._cursor.fetchmany(size)
 
     def fetchall(self):
         return self._cursor.fetchall()
@@ -314,8 +329,12 @@ def pool_stats() -> dict[str, Any]:
     return stats
 
 
-def check_db_health() -> dict[str, Any]:
-    """Lightweight connectivity probe for /health and startup."""
+def check_db_health(*, light: bool = False) -> dict[str, Any]:
+    """Connectivity probe for /health.
+
+    light=True skips PRAGMA quick_check (expensive under WAL contention) and
+    uses SELECT 1 — preferred for the cached hot path.
+    """
     start = time.perf_counter()
     conn = get_connection()
     journal_mode = None
@@ -323,9 +342,14 @@ def check_db_health() -> dict[str, Any]:
     try:
         cur = conn.cursor()
         if DB_DRIVER == "sqlite":
-            cur.execute("PRAGMA quick_check(1)")
-            row = cur.fetchone()
-            ok = bool(row and (row[0] if not isinstance(row, dict) else list(row.values())[0]) == "ok")
+            if light:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+                ok = True
+            else:
+                cur.execute("PRAGMA quick_check(1)")
+                row = cur.fetchone()
+                ok = bool(row and (row[0] if not isinstance(row, dict) else list(row.values())[0]) == "ok")
             cur.execute("PRAGMA journal_mode")
             jrow = cur.fetchone()
             journal_mode = jrow[0] if jrow and not isinstance(jrow, dict) else (

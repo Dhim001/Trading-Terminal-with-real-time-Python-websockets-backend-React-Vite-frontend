@@ -11,6 +11,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, Suspense, lazy } from 'react';
 import { toast } from 'sonner';
 import { useStore } from '../store/useStore';
+import { useResearchStore } from '../store/useResearchStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { sendAction } from '../api/transport';
 import { Action } from '../api/protocol';
@@ -20,7 +21,7 @@ import { selectCashTotal } from '../store/selectors';
 import {
   Briefcase, List, Landmark, Cpu, Activity, TrendingUp,
   Play, Settings, Trash2, XSquare, Maximize2, Minimize2, ShieldAlert, Pause, PlayCircle, OctagonX,
-  RefreshCw, AlertTriangle, Zap, History, Brain, Radar, ChevronUp, Loader2,
+  RefreshCw, AlertTriangle, Zap, History, Brain, Radar, MessageSquare, ChevronUp, Loader2,
 } from 'lucide-react';
 import TradeHistoryContent from './TradeHistoryPanel';
 import BacktestResultsPanel from './BacktestResultsPanel';
@@ -44,6 +45,7 @@ const TickViewerTab = lazy(() => import('./TickViewerTab'));
 const BotHistoryTab = lazy(() => import('./BotHistoryTab'));
 const AnalystTab = lazy(() => import('./AnalystTab'));
 const ScannerTab = lazy(() => import('./ScannerTab'));
+const CopilotTab = lazy(() => import('./dock/CopilotTab'));
 const EquityCurveTab = lazy(() => import('./EquityCurveTab'));
 
 function DockTabFallback() {
@@ -93,7 +95,7 @@ const DOCK_MAX = 560;
 const DOCK_DEFAULT = 320;
 
 const DOCK_TAB_IDS = new Set([
-  'positions', 'orders', 'balances', 'algo', 'scanner', 'analyst',
+  'positions', 'orders', 'balances', 'algo', 'scanner', 'analyst', 'copilot',
   'reconcile', 'bots', 'ticks', 'history', 'equity',
 ]);
 
@@ -124,7 +126,8 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
   const paperExecution = useStore((s) => isPaperExecutionMode(s.terminalMode, s.executionMode));
   const isBotRunning = useStore((s) => s.isBotRunning);
   const isLive = useStore((s) => s.isLive);
-  const analystBadge = useStore((s) => (s.agentInsightHistory[s.activeSymbol] ?? []).length || null);
+  const activeSymbol = useStore((s) => s.activeSymbol);
+  const analystBadge = useResearchStore((s) => (s.agentInsightHistory[activeSymbol] ?? []).length || null);
   const workspaceTab = normalizeDockTab(
     useSettingsStore(state => state.settings.workspace?.dockActiveTab || 'positions'),
   );
@@ -285,7 +288,7 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
     return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
   }, [updateWorkspace]);
 
-  const scanBadge = useStore((s) => {
+  const scanBadge = useResearchStore((s) => {
     const rows = s.scanResults?.rows ?? [];
     return rows.filter((r) => r.signal && r.signal !== 'NONE').length || null;
   });
@@ -298,6 +301,7 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
       { id: 'algo',      label: 'Algo Bot',  icon: Cpu,      group: 'automation' },
       { id: 'scanner',   label: 'Scanner',   icon: Radar,    badge: scanBadge, group: 'intelligence', hint: 'Quick peek — open Hub (⌘I) for full scanner workspace' },
       { id: 'analyst',   label: 'Analyst',   icon: Brain,    badge: analystBadge, group: 'intelligence', hint: 'Quick peek — open Hub (⌘I) for full analyst history' },
+      { id: 'copilot',   label: 'Copilot',   icon: MessageSquare, group: 'intelligence', hint: 'Natural-language control of portfolio, bots, and analysis' },
       { id: 'reconcile', label: 'Reconcile', icon: AlertTriangle, badge: ambiguousCount || null, group: 'automation' },
       { id: 'bots',      label: 'Bot History', icon: History, badge: botHistoryCount || null, group: 'automation' },
       { id: 'ticks',     label: 'Ticks',     icon: Zap,      group: 'data' },
@@ -351,6 +355,11 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
         {isDetached('analyst') && (
           <DetachedPanelPortal title="Analyst" onClose={() => attach('analyst')}>
             <DetachedLazyPanel><AnalystTab /></DetachedLazyPanel>
+          </DetachedPanelPortal>
+        )}
+        {isDetached('copilot') && (
+          <DetachedPanelPortal title="Copilot" onClose={() => attach('copilot')}>
+            <DetachedLazyPanel><CopilotTab /></DetachedLazyPanel>
           </DetachedPanelPortal>
         )}
         {isDetached('reconcile') && (
@@ -462,6 +471,11 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
         {isDetached('analyst') && (
           <DetachedPanelPortal title="Analyst" onClose={() => attach('analyst')}>
             <DetachedLazyPanel><AnalystTab /></DetachedLazyPanel>
+          </DetachedPanelPortal>
+        )}
+        {isDetached('copilot') && (
+          <DetachedPanelPortal title="Copilot" onClose={() => attach('copilot')}>
+            <DetachedLazyPanel><CopilotTab /></DetachedLazyPanel>
           </DetachedPanelPortal>
         )}
         {isDetached('reconcile') && (
@@ -636,6 +650,11 @@ export default function ResizableDock({ setDockHeight: setParentDockHeight, init
           <TabsContent value="analyst" className="dock-tab-body dock-tab-body--cached mt-0 overflow-hidden">
             <ErrorBoundary name="Chart Analyst">
               {renderMountedTab('analyst', AnalystTab, { suspense: true })}
+            </ErrorBoundary>
+          </TabsContent>
+          <TabsContent value="copilot" className="dock-tab-body dock-tab-body--cached mt-0 overflow-hidden">
+            <ErrorBoundary name="Trade Copilot">
+              {renderMountedTab('copilot', CopilotTab, { suspense: true })}
             </ErrorBoundary>
           </TabsContent>
           <TabsContent value="reconcile" className="dock-tab-body dock-tab-body--cached mt-0 overflow-hidden">

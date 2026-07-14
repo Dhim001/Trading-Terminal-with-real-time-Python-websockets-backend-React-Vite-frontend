@@ -3,9 +3,11 @@ import { applyHttpEnvelope } from './dispatch';
 import { Action, MessageType } from './protocol';
 import { invokeHttpAction } from './transport';
 import { useStore } from '../store/useStore';
+import { useResearchStore } from '../store/useResearchStore';
 import { normalizeAnalystTimeframe } from '../lib/agentInsights';
 import { clearBacktestClientTimeout } from '../lib/backtestTimeouts';
 import { trimBacktestPayload, buildBacktestOverlay } from '../lib/backtestSlim';
+import { saveFullBacktestResults } from '../services/backtestStorage';
 import { stopBacktestJobPolling, scheduleBacktestJobPoll } from '../lib/backtestPolling';
 import { toast } from 'sonner';
 import { normalizeOrderCapabilities } from '../lib/positionActions';
@@ -66,9 +68,79 @@ export function applySessionToStore(session, storeActions) {
   }
 }
 
+/** GET /health/live — fast liveness (+ cheap in-memory feed fields). */
+export async function fetchHealthLive() {
+  return apiRequest('/health/live');
+}
+
 /** GET /health/massive — lightweight Massive feed ops (no DB/LLM). */
 export async function fetchMassiveFeedHealth() {
   return apiRequest('/health/massive');
+}
+
+/** GET /api/v1/market/footprint — fetch aggregated footprint volume heatmap */
+export async function fetchFootprint(symbol, from_ts, to_ts, price_step, time_bucket_ms) {
+  const query = new URLSearchParams({
+    symbol,
+    from_ts: Math.floor(from_ts),
+    to_ts: Math.floor(to_ts),
+    price_step,
+    time_bucket_ms: Math.floor(time_bucket_ms),
+  });
+  const res = await apiRequest(`/api/v1/market/footprint?${query.toString()}`);
+  if (!res?.ok) return { footprint: [], meta: null };
+  return {
+    footprint: Array.isArray(res.footprint) ? res.footprint : [],
+    meta: res.meta || null,
+    message: res.message || null,
+  };
+}
+
+/** POST /api/v1/journal/briefing/generate — trigger the daily briefing agent */
+export async function generateBriefing() {
+  const res = await apiRequest('/api/v1/journal/briefing/generate', { method: 'POST', timeoutMs: 60000 });
+  return res;
+}
+
+/** POST /api/v1/copilot/chat — TRADE_COPILOT conversational turn */
+export async function copilotChat({ message, session_id, active_symbol } = {}) {
+  return apiRequest('/api/v1/copilot/chat', {
+    method: 'POST',
+    timeoutMs: 300000,
+    // Pass a plain object — apiRequest JSON.stringifies once.
+    body: { message, session_id, active_symbol },
+  });
+}
+
+/** POST /api/v1/copilot/confirm — execute a pending mutating action */
+export async function copilotConfirm(pending_id) {
+  return apiRequest('/api/v1/copilot/confirm', {
+    method: 'POST',
+    timeoutMs: 60000,
+    body: { pending_id },
+  });
+}
+
+/** POST /api/v1/copilot/confirm — cancel pending action */
+export async function copilotCancel(pending_id) {
+  return apiRequest('/api/v1/copilot/confirm', {
+    method: 'POST',
+    body: { pending_id, cancel: true },
+  });
+}
+
+/** GET /api/v1/copilot/history */
+export async function fetchCopilotHistory(session_id, { limit = 40 } = {}) {
+  const qs = new URLSearchParams({ session_id, limit: String(limit) });
+  return apiRequest(`/api/v1/copilot/history?${qs}`);
+}
+
+/** POST /api/v1/copilot/clear */
+export async function clearCopilotSession(session_id) {
+  return apiRequest('/api/v1/copilot/clear', {
+    method: 'POST',
+    body: { session_id },
+  });
 }
 
 /** GET /health — liveness + partial terminal metadata (not action-router envelope). */
@@ -296,34 +368,26 @@ export async function fetchOptimizationRun(runId) {
 }
 
 export async function getOptimizationRun(runId) {
-  const res = await fetch(`${API_BASE_URL}/api/v1/backtest/optimizations/${runId}`, { headers: getHeaders() });
-  if (!res.ok) throw new Error('Failed to fetch optimization run');
-  return res.json();
+  const body = await apiRequest(`/api/v1/backtest/optimizations/${encodeURIComponent(runId)}`);
+  if (!body?.ok || !body?.run) throw new Error(body?.error || 'Failed to fetch optimization run');
+  return body.run;
 }
 
 export async function fetchWorkspaces() {
-  const res = await fetch(`${API_BASE_URL}/api/v1/workspaces`, { headers: getHeaders() });
-  if (!res.ok) throw new Error('Failed to fetch workspaces');
-  return res.json();
+  return apiRequest('/api/v1/workspaces');
 }
 
 export async function saveWorkspace(id, name, state) {
-  const res = await fetch(`${API_BASE_URL}/api/v1/workspaces`, {
+  return apiRequest('/api/v1/workspaces', {
     method: 'POST',
-    headers: getHeaders(),
-    body: JSON.stringify({ id, name, state }),
+    body: { id, name, state },
   });
-  if (!res.ok) throw new Error('Failed to save workspace');
-  return res.json();
 }
 
 export async function deleteWorkspace(id) {
-  const res = await fetch(`${API_BASE_URL}/api/v1/workspaces/${id}`, {
+  return apiRequest(`/api/v1/workspaces/${encodeURIComponent(id)}`, {
     method: 'DELETE',
-    headers: getHeaders(),
   });
-  if (!res.ok) throw new Error('Failed to delete workspace');
-  return res.json();
 }
 
 /** GET /api/v1/bots/calibration — closed-trade win rates by setup bucket. */
@@ -566,6 +630,7 @@ export function startBacktestJobPolling(jobId, storeActions) {
             ...fresh.results,
             run_id: fresh.run_id ?? fresh.results.run_id,
           });
+          saveFullBacktestResults(wire);
           storeActions.setBacktestResults(wire);
           storeActions.setBacktestRunning(false);
           storeActions.setBacktestProgress(null);
@@ -576,7 +641,7 @@ export function startBacktestJobPolling(jobId, storeActions) {
           const trades = wire?.trade_count ?? 0;
           toast.success(
             `Background backtest complete · ${pnl != null ? `$${Number(pnl).toFixed(2)}` : '—'} · ${trades} trades`,
-            { action: { label: 'Open Lab', onClick: () => useStore.getState().openBacktestLab('results') } },
+            { action: { label: 'Open Lab', onClick: () => useResearchStore.getState().openBacktestLab('results') } },
           );
           return;
         }

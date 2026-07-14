@@ -409,6 +409,21 @@ def init_db():
     )
 
     cursor.execute("""
+        CREATE TABLE IF NOT EXISTS copilot_messages (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL DEFAULT '',
+            intent TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_copilot_messages_session ON copilot_messages (session_id, created_at)"
+    )
+
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS risk_state (
             key TEXT PRIMARY KEY,
             value REAL NOT NULL,
@@ -585,7 +600,7 @@ def reset_db():
     conn.commit()
     conn.close()
 
-def get_db_stats():
+def get_db_stats(*, include_archive: bool = True):
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -603,19 +618,29 @@ def get_db_stats():
         row = cursor.fetchone()
         stats["filled_trades_count"] = _row_val(row)
 
-        try:
-            from app.services.archive.query import get_archive_stats
-            from app.services.archive.writer import get_archive_writer
+        if include_archive:
+            try:
+                from app.services.archive.query import get_archive_stats
+                from app.services.archive.writer import get_archive_writer
 
-            archive_stats = get_archive_stats()
-            writer = get_archive_writer()
-            stats["archive"] = {
-                **archive_stats,
-                "pending_flush": writer.pending_count,
-                "total_flushed": writer.total_flushed,
-            }
-        except Exception:
-            pass
+                archive_stats = get_archive_stats()
+                writer = get_archive_writer()
+                stats["archive"] = {
+                    **archive_stats,
+                    "pending_flush": writer.pending_count,
+                    "total_flushed": writer.total_flushed,
+                }
+            except Exception:
+                pass
+            # Tick COUNT(*) is also an archive table scan — keep it behind the same
+            # gate as get_archive_stats() so light callers (e.g. /health) stay cheap.
+            try:
+                cursor.execute("SELECT COUNT(*) FROM market_ticks")
+                row = cursor.fetchone()
+                stats["archive"] = stats.get("archive") or {}
+                stats["archive"]["ticks"] = _row_val(row)
+            except Exception:
+                pass
         try:
             from app.services.reconciliation import list_ambiguous_orders
 
@@ -628,13 +653,6 @@ def get_db_stats():
             from app.services.runtime.system_state import runtime_status_dict
 
             stats["runtime"] = runtime_status_dict()
-        except Exception:
-            pass
-        try:
-            cursor.execute("SELECT COUNT(*) FROM market_ticks")
-            row = cursor.fetchone()
-            stats["archive"] = stats.get("archive") or {}
-            stats["archive"]["ticks"] = _row_val(row)
         except Exception:
             pass
         try:

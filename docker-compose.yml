@@ -49,7 +49,7 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: timescale/timescaledb:latest-pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-trading}
@@ -112,7 +112,7 @@ services:
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health', timeout=3)",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/health/live', timeout=3)",
         ]
       interval: 10s
       timeout: 5s

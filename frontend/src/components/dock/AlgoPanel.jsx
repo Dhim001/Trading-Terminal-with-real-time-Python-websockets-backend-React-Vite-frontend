@@ -4,6 +4,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { toast } from 'sonner';
 import { useStore } from '../../store/useStore';
+import { useResearchStore } from '../../store/useResearchStore';
 import { sendAction } from '../../api/transport';
 import { Action } from '../../api/protocol';
 import { fetchBots, withLlmModel } from '../../api/endpoints';
@@ -12,7 +13,7 @@ import { selectCashTotal } from '../../store/selectors';
 import { useShallow } from 'zustand/react/shallow';
 import {
   Cpu, Play, Settings, Trash2, XSquare, ShieldAlert, Pause, PlayCircle, OctagonX,
-  RefreshCw, AlertTriangle, Activity, Loader2, Maximize2,
+  RefreshCw, AlertTriangle, Activity, Loader2, Maximize2, Bot,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from '@/components/ui/dialog';
@@ -57,6 +58,8 @@ import { cn } from '@/lib/utils';
 import { openBacktestLabResults } from '../../lib/backtestLab';
 import { formatLastSignal } from '@/lib/formatTime';
 import { BAR_TIMEFRAMES, deployTimeframeSummary, formatBarTimeframeLabel } from '@/lib/barTimeframes';
+import BotRiskHoldBadge from '../BotRiskHoldBadge';
+import { useEffectiveRiskHold } from '@/lib/botRiskHold';
 import { DIRECTION_MODE_OPTIONS, formatDirectionModeLabel } from '@/lib/botConfigDisplay';
 import { isLiveMassiveMode, isPaperExecutionMode } from '@/lib/massiveMarket';
 import { backtestFingerprint } from '@/lib/backtestDisplay';
@@ -65,16 +68,141 @@ import DeployGatePanel from '../DeployGatePanel';
 import { selectAgentInsight } from '@/lib/agentInsights';
 import { isSignalLog, logLineClass } from '@/lib/botLogInsight';
 
+function statusBadgeVariant(status) {
+  if (status === 'RUNNING') return 'buy';
+  if (status === 'PAUSED') return 'secondary';
+  if (status === 'ERROR') return 'destructive';
+  return 'sell';
+}
+
+function ActiveBotRow({
+  bot,
+  pos,
+  selected,
+  agentInsights,
+  onSelect,
+  onPause,
+  onResume,
+  onStop,
+  onSetStopLoss,
+  onSetTakeProfit,
+}) {
+  const inPosition = pos && Math.abs(pos.size) > 0;
+  const { hold: riskHold, remaining } = useEffectiveRiskHold(bot.risk_hold);
+
+  return (
+    <DataTableRow
+      rowVariant="dock"
+      deferred
+      className={cn(
+        'algo-bot-row cursor-pointer',
+        selected && 'row-active',
+        riskHold?.kind === 'cooloff' && 'algo-bot-row--cooloff',
+        riskHold?.kind === 'streak_limit' && 'algo-bot-row--streak-hold',
+        riskHold?.kind === 'drawdown' && 'algo-bot-row--drawdown-hold',
+      )}
+      onClick={() => onSelect(bot.id)}
+    >
+      <DataTableCell className="font-bold">{bot.symbol}</DataTableCell>
+      <DataTableCell className="text-xs">
+        <StrategyBadge strategy={bot.strategy} compact />
+        {bot.execution_mode === 'TICK' && (
+          <Badge variant="outline" className="ml-1 h-4 px-1 text-[0.65rem]">TICK</Badge>
+        )}
+      </DataTableCell>
+      <DataTableCell align="center" className="text-xs num-mono text-muted-foreground">
+        {bot.execution_mode === 'TICK' ? 'tick' : formatBarTimeframeLabel(bot.timeframe)}
+      </DataTableCell>
+      <DataTableCell align="center">
+        {inPosition ? (
+          <Badge variant={pos.size > 0 ? 'buy' : 'sell'}>
+            {pos.size > 0 ? 'LONG' : 'SHORT'}
+          </Badge>
+        ) : (
+          <span className="text-secondary-foreground text-xs">FLAT</span>
+        )}
+      </DataTableCell>
+      <DataTableCell numeric align="right">${bot.allocation.toLocaleString()}</DataTableCell>
+      <DataTableCell
+        numeric
+        align="right"
+        className={cn(
+          'font-semibold',
+          (bot.daily_pnl ?? 0) >= 0 ? 'text-trading-up' : 'text-trading-down',
+        )}
+      >
+        {(bot.daily_pnl ?? 0) >= 0 ? '+' : ''}{(bot.daily_pnl ?? 0).toFixed(2)}
+      </DataTableCell>
+      <DataTableCell className="algo-last-signal">
+        <span title={bot.last_signal_at || undefined}>{formatLastSignal(bot.last_signal_at)}</span>
+        {bot.strategy === 'CHART_AGENT' && (() => {
+          const insight = selectAgentInsight(
+            agentInsights,
+            bot.symbol,
+            bot.execution_mode === 'TICK' ? '1m' : bot.timeframe,
+          );
+          return insight?.confidence != null ? (
+            <span className="ml-1 text-xs text-muted-foreground">
+              ({Math.round(insight.confidence * 100)}% conf)
+            </span>
+          ) : null;
+        })()}
+      </DataTableCell>
+      <DataTableCell align="center">
+        <div className="algo-bot-status-cell">
+          <Badge variant={statusBadgeVariant(bot.status)}>{bot.status}</Badge>
+          <BotRiskHoldBadge hold={riskHold} remainingSec={remaining} compact />
+        </div>
+      </DataTableCell>
+      <DataTableCell align="center" onClick={(e) => e.stopPropagation()}>
+        <div className="algo-bot-actions">
+          {bot.status === 'RUNNING' && (
+            <Button variant="outline" size="xs" onClick={() => onPause(bot.id)} title="Pause bot">
+              <Pause />
+            </Button>
+          )}
+          {bot.status === 'PAUSED' && (
+            <Button variant="outline" size="xs" onClick={() => onResume(bot.id)} title="Resume bot">
+              <PlayCircle />
+            </Button>
+          )}
+          {bot.status !== 'STOPPED' && (
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => onSetStopLoss(bot)}
+              title="Set stop loss on chart"
+            >
+              SL
+            </Button>
+          )}
+          {bot.status !== 'STOPPED' && (
+            <Button
+              variant="outline"
+              size="xs"
+              onClick={() => onSetTakeProfit(bot)}
+              title="Set take profit on chart"
+            >
+              TP
+            </Button>
+          )}
+          {bot.status !== 'STOPPED' && (
+            <Button variant="destructive" size="xs" onClick={() => onStop(bot.id)} title="Stop bot">
+              STOP
+            </Button>
+          )}
+        </div>
+      </DataTableCell>
+    </DataTableRow>
+  );
+}
+
 // ── Algo Bot Tab ──────────────────────────────────────────────────
 export function AlgoTab({ hideToolbar = false }) {
   const {
     activeBots, botStrategy, botExecutionMode, botTimeframe, botConfig, activeSymbol, symbolsList,
     setBotStrategy, setBotExecutionMode, setBotTimeframe, updateBotConfig, clearBotLogs, botLogs,
-    strategyTemplates, backtestResults, backtestRuns, backtestRunning, backtestSnapshot,
-    backtestLabOpen, backtestLastError, backtestLastRequest, backtestJobId,
-    setBacktestRunning, setBacktestProgress, setBacktestSnapshot,
-    openBacktestLab, setStoreBacktestDays, setStoreBacktestOos,
-    clearBacktestLastError, setBacktestLastError,
+    strategyTemplates,
     setChartInteractionMode,
     isLive, allowLiveBots, allowCustomStrategies, terminalMode, terminalRole, distributed, botMinCandles,
     executionMode,
@@ -96,22 +224,6 @@ export function AlgoTab({ hideToolbar = false }) {
     clearBotLogs: s.clearBotLogs,
     botLogs: s.botLogs,
     strategyTemplates: s.strategyTemplates,
-    backtestResults: s.backtestResults,
-    backtestRuns: s.backtestRuns,
-    backtestRunning: s.backtestRunning,
-    backtestSnapshot: s.backtestSnapshot,
-    backtestLabOpen: s.backtestLabOpen,
-    backtestLastError: s.backtestLastError,
-    backtestLastRequest: s.backtestLastRequest,
-    backtestJobId: s.backtestJobId,
-    setBacktestRunning: s.setBacktestRunning,
-    setBacktestProgress: s.setBacktestProgress,
-    setBacktestSnapshot: s.setBacktestSnapshot,
-    openBacktestLab: s.openBacktestLab,
-    setStoreBacktestDays: s.setBacktestDays,
-    setStoreBacktestOos: s.setBacktestOos,
-    clearBacktestLastError: s.clearBacktestLastError,
-    setBacktestLastError: s.setBacktestLastError,
     setChartInteractionMode: s.setChartInteractionMode,
     isLive: s.isLive,
     allowLiveBots: s.allowLiveBots,
@@ -128,8 +240,32 @@ export function AlgoTab({ hideToolbar = false }) {
     setBotDrawerOpen: s.setBotDrawerOpen,
     ambiguousOrders: s.ambiguousOrders,
   })));
+  const {
+    backtestResults, backtestRuns, backtestRunning, backtestSnapshot,
+    backtestLabOpen, backtestLastError, backtestLastRequest, backtestJobId,
+    setBacktestRunning, setBacktestProgress, setBacktestSnapshot,
+    openBacktestLab, setStoreBacktestDays, setStoreBacktestOos,
+    clearBacktestLastError, setBacktestLastError,
+  } = useResearchStore(useShallow((s) => ({
+    backtestResults: s.backtestResults,
+    backtestRuns: s.backtestRuns,
+    backtestRunning: s.backtestRunning,
+    backtestSnapshot: s.backtestSnapshot,
+    backtestLabOpen: s.backtestLabOpen,
+    backtestLastError: s.backtestLastError,
+    backtestLastRequest: s.backtestLastRequest,
+    backtestJobId: s.backtestJobId,
+    setBacktestRunning: s.setBacktestRunning,
+    setBacktestProgress: s.setBacktestProgress,
+    setBacktestSnapshot: s.setBacktestSnapshot,
+    openBacktestLab: s.openBacktestLab,
+    setStoreBacktestDays: s.setBacktestDays,
+    setStoreBacktestOos: s.setBacktestOos,
+    clearBacktestLastError: s.clearBacktestLastError,
+    setBacktestLastError: s.setBacktestLastError,
+  })));
   const positions = useStore((state) => state.positions);
-  const agentInsights = useStore((state) => state.agentInsights);
+  const agentInsights = useResearchStore((state) => state.agentInsights);
   const tickerPrice = useStore((state) => state.tickerData[state.activeSymbol]?.price);
   const cashTotal = useStore(selectCashTotal);
 
@@ -154,6 +290,7 @@ export function AlgoTab({ hideToolbar = false }) {
   const [logFilter, setLogFilter] = useState('all');
   const agentLlmAvailable = useStore((s) => s.agentLlmAvailable);
   const agentLlmEnabled = useStore((s) => s.agentLlmEnabled);
+  const [botCategoryTab, setBotCategoryTab] = useState('normal');
   const logScrollRef = useRef(null);
   const logCountRef = useRef(0);
   const filteredBotLogs = useMemo(() => {
@@ -252,7 +389,7 @@ export function AlgoTab({ hideToolbar = false }) {
       setBacktestLiveParity,
       setMetaLabelWalkForward,
       openBacktestLab,
-      setOptimizerPreset: useStore.getState().setOptimizerPreset,
+      setOptimizerPreset: useResearchStore.getState().setOptimizerPreset,
     });
     if (ok) {
       setActiveWorkflowPreset(presetId);
@@ -318,7 +455,7 @@ export function AlgoTab({ hideToolbar = false }) {
       days: request?.days,
       portfolioSymbolCount: request?.portfolio_symbols?.length ?? 0,
       onTimeout: (timeoutMs) => {
-        if (useStore.getState().backtestRunning) {
+        if (useResearchStore.getState().backtestRunning) {
           stopBacktestJobPolling();
           setBacktestRunning(false);
           setBacktestProgress(null);
@@ -365,7 +502,7 @@ export function AlgoTab({ hideToolbar = false }) {
       days,
       portfolioSymbolCount,
       onTimeout: (timeoutMs) => {
-        if (useStore.getState().backtestRunning) {
+        if (useResearchStore.getState().backtestRunning) {
           stopBacktestJobPolling();
           setBacktestRunning(false);
           setBacktestProgress(null);
@@ -399,7 +536,7 @@ export function AlgoTab({ hideToolbar = false }) {
     clearBacktestClientTimeout();
     setBacktestRunning(false);
     setBacktestProgress(null);
-    const jobId = useStore.getState().backtestJobId;
+    const jobId = useResearchStore.getState().backtestJobId;
     sendAction(Action.CANCEL_BACKTEST, jobId ? { job_id: jobId } : {});
   };
 
@@ -430,7 +567,7 @@ export function AlgoTab({ hideToolbar = false }) {
       allocation: botConfig.allocation,
       executionMode: botExecutionMode,
       config: botConfig,
-      results: useStore.getState().backtestResults,
+      results: useResearchStore.getState().backtestResults,
       snapshot: backtestSnapshot,
       days,
       forceDeploy,
@@ -440,7 +577,8 @@ export function AlgoTab({ hideToolbar = false }) {
 
   const filteredTemplates = strategyTemplates.filter(
     (t) => (t.execution_mode || 'BAR_CLOSE') === botExecutionMode
-      && (allowCustomStrategies || (t.strategy !== 'CUSTOM' && !t.custom)),
+      && (allowCustomStrategies || (t.strategy !== 'CUSTOM' && !t.custom))
+      && (botCategoryTab === 'agentic' ? t.category === 'agent' : t.category !== 'agent'),
   );
 
   const selectTemplate = (template) => {
@@ -485,13 +623,6 @@ export function AlgoTab({ hideToolbar = false }) {
   const confirmStopAll = () => {
     setStopAllOpen(false);
     sendAction(Action.BOT_STOP_ALL, {});
-  };
-
-  const statusBadgeVariant = (status) => {
-    if (status === 'RUNNING') return 'buy';
-    if (status === 'PAUSED') return 'secondary';
-    if (status === 'ERROR') return 'destructive';
-    return 'sell';
   };
 
   const logLineClassLocal = (log) => logLineClass(log);
@@ -685,7 +816,26 @@ export function AlgoTab({ hideToolbar = false }) {
             )}
 
             <div className="algo-deploy-field">
-              <Label className="algo-field-label">Strategy Templates</Label>
+              <div className="flex items-center justify-between mb-2">
+                <Label className="algo-field-label mb-0">Strategy Templates</Label>
+                <div className="flex bg-slate-950/50 rounded-md p-0.5 border border-slate-800/60">
+                  <button
+                    className={`px-3 py-1 text-xs font-medium rounded-sm transition-colors ${botCategoryTab === 'normal' ? 'bg-slate-800 text-slate-100 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                    onClick={() => setBotCategoryTab('normal')}
+                    type="button"
+                  >
+                    Normal
+                  </button>
+                  <button
+                    className={`px-3 py-1 text-xs font-medium rounded-sm transition-colors flex items-center gap-1.5 ${botCategoryTab === 'agentic' ? 'bg-slate-800 text-slate-100 shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                    onClick={() => setBotCategoryTab('agentic')}
+                    type="button"
+                  >
+                    <Bot size={12} />
+                    Agentic
+                  </button>
+                </div>
+              </div>
               <div className="algo-template-grid">
                 {filteredTemplates.map(t => (
                   <StrategyTemplateCard
@@ -1114,15 +1264,17 @@ export function AlgoTab({ hideToolbar = false }) {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper">
-                  <SelectItem value="7" className="text-xs">7 days (in-memory + archive)</SelectItem>
-                  <SelectItem value="30" className="text-xs">30 days (archive 1m)</SelectItem>
-                  <SelectItem value="90" className="text-xs">90 days (archive 1m max)</SelectItem>
+                  <SelectItem value="7" className="text-xs">7 days (local buffer + archive)</SelectItem>
+                  <SelectItem value="30" className="text-xs">30 days</SelectItem>
+                  <SelectItem value="90" className="text-xs">90 days</SelectItem>
+                  <SelectItem value="180" className="text-xs">180 days (broker REST if needed)</SelectItem>
+                  <SelectItem value="365" className="text-xs">365 days (broker REST if needed)</SelectItem>
                 </SelectContent>
               </Select>
               <span className="algo-field-hint">
                 {botTimeframe === '1m'
-                  ? 'Uses archived 1m bars when range exceeds live buffer.'
-                  : 'Ranges above 90d are capped to 1m archive retention for accurate resampling.'}
+                  ? 'Long ranges fill older 1m gaps from Massive/broker REST when local archive is short.'
+                  : 'Higher TF long ranges use Massive native bars (not limited to local 1m retention).'}
               </span>
             </div>
 
@@ -1355,107 +1507,21 @@ export function AlgoTab({ hideToolbar = false }) {
                   </DataTableCell>
                 </DataTableRow>
               ) : (
-                activeBots.map(bot => {
-                  const pos = positions[bot.symbol];
-                  const inPosition = pos && Math.abs(pos.size) > 0;
-                  return (
-                  <DataTableRow
+                activeBots.map((bot) => (
+                  <ActiveBotRow
                     key={bot.id}
-                    rowVariant="dock"
-                    deferred
-                    className={cn('algo-bot-row cursor-pointer', selectedBotId === bot.id && 'row-active')}
-                    onClick={() => selectBot(bot.id)}
-                  >
-                    <DataTableCell className="font-bold">{bot.symbol}</DataTableCell>
-                    <DataTableCell className="text-xs">
-                      <StrategyBadge strategy={bot.strategy} compact />
-                      {bot.execution_mode === 'TICK' && (
-                        <Badge variant="outline" className="ml-1 h-4 px-1 text-[0.65rem]">TICK</Badge>
-                      )}
-                    </DataTableCell>
-                    <DataTableCell align="center" className="text-xs num-mono text-muted-foreground">
-                      {bot.execution_mode === 'TICK' ? 'tick' : formatBarTimeframeLabel(bot.timeframe)}
-                    </DataTableCell>
-                    <DataTableCell align="center">
-                      {inPosition ? (
-                        <Badge variant={pos.size > 0 ? 'buy' : 'sell'}>
-                          {pos.size > 0 ? 'LONG' : 'SHORT'}
-                        </Badge>
-                      ) : (
-                        <span className="text-secondary-foreground text-xs">FLAT</span>
-                      )}
-                    </DataTableCell>
-                    <DataTableCell numeric align="right">${bot.allocation.toLocaleString()}</DataTableCell>
-                    <DataTableCell
-                      numeric
-                      align="right"
-                      className={cn(
-                        'font-semibold',
-                        (bot.daily_pnl ?? 0) >= 0 ? 'text-trading-up' : 'text-trading-down',
-                      )}
-                    >
-                      {(bot.daily_pnl ?? 0) >= 0 ? '+' : ''}{(bot.daily_pnl ?? 0).toFixed(2)}
-                    </DataTableCell>
-                    <DataTableCell className="algo-last-signal">
-                      <span title={bot.last_signal_at || undefined}>{formatLastSignal(bot.last_signal_at)}</span>
-                      {bot.strategy === 'CHART_AGENT' && (() => {
-                        const insight = selectAgentInsight(
-                          agentInsights,
-                          bot.symbol,
-                          bot.execution_mode === 'TICK' ? '1m' : bot.timeframe,
-                        );
-                        return insight?.confidence != null ? (
-                          <span className="ml-1 text-xs text-muted-foreground">
-                            ({Math.round(insight.confidence * 100)}% conf)
-                          </span>
-                        ) : null;
-                      })()}
-                    </DataTableCell>
-                    <DataTableCell align="center">
-                      <Badge variant={statusBadgeVariant(bot.status)}>{bot.status}</Badge>
-                    </DataTableCell>
-                    <DataTableCell align="center" onClick={e => e.stopPropagation()}>
-                      <div className="algo-bot-actions">
-                        {bot.status === 'RUNNING' && (
-                          <Button variant="outline" size="xs" onClick={() => handlePauseBot(bot.id)} title="Pause bot">
-                            <Pause />
-                          </Button>
-                        )}
-                        {bot.status === 'PAUSED' && (
-                          <Button variant="outline" size="xs" onClick={() => handleResumeBot(bot.id)} title="Resume bot">
-                            <PlayCircle />
-                          </Button>
-                        )}
-                        {bot.status !== 'STOPPED' && (
-                          <Button
-                            variant="outline"
-                            size="xs"
-                            onClick={() => handleSetBotStopLoss(bot)}
-                            title="Set stop loss on chart"
-                          >
-                            SL
-                          </Button>
-                        )}
-                        {bot.status !== 'STOPPED' && (
-                          <Button
-                            variant="outline"
-                            size="xs"
-                            onClick={() => handleSetBotTakeProfit(bot)}
-                            title="Set take profit on chart"
-                          >
-                            TP
-                          </Button>
-                        )}
-                        {bot.status !== 'STOPPED' && (
-                          <Button variant="destructive" size="xs" onClick={() => handleStopBot(bot.id)} title="Stop bot">
-                            STOP
-                          </Button>
-                        )}
-                      </div>
-                    </DataTableCell>
-                  </DataTableRow>
-                  );
-                })
+                    bot={bot}
+                    pos={positions[bot.symbol]}
+                    selected={selectedBotId === bot.id}
+                    agentInsights={agentInsights}
+                    onSelect={selectBot}
+                    onPause={handlePauseBot}
+                    onResume={handleResumeBot}
+                    onStop={handleStopBot}
+                    onSetStopLoss={handleSetBotStopLoss}
+                    onSetTakeProfit={handleSetBotTakeProfit}
+                  />
+                ))
               )}
             </DataTableBody>
           </DataTableRoot>

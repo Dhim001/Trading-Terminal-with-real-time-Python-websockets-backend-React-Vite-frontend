@@ -1,6 +1,7 @@
 """Pre-trade risk checks for algo bot orders."""
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -28,6 +29,169 @@ class RiskDecision:
     allowed: bool
     reason: str
     quantity: float | None = None
+
+
+def _parse_event_ts(ts) -> datetime | None:
+    if ts is None:
+        return None
+    try:
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        if isinstance(ts, str):
+            raw = ts[:-1] + "+00:00" if ts.endswith("Z") else ts
+            dt = datetime.fromisoformat(raw)
+            # SQLite CURRENT_TIMESTAMP is UTC without tzinfo — treat naive as UTC.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+    except (TypeError, ValueError, OSError):
+        return None
+    return None
+
+
+def _resolve_bot_total_pnl(bot: dict, total_pnl: float | None = None) -> float:
+    if total_pnl is not None:
+        return float(total_pnl)
+    return float(bot.get("total_pnl") or bot.get("pnl") or 0)
+
+
+def _compute_drawdown_hold(bot: dict, total_pnl: float | None = None) -> dict | None:
+    """Return drawdown circuit-breaker hold when cumulative loss exceeds the limit."""
+    cfg = RiskGate._parse_bot_config(bot)
+    max_dd_pct = float(cfg.get("max_drawdown_pct", BOT_MAX_DRAWDOWN_PCT))
+    if max_dd_pct <= 0:
+        return None
+
+    allocation = float(bot.get("allocation") or 0)
+    if allocation <= 0:
+        return None
+
+    pnl = _resolve_bot_total_pnl(bot, total_pnl)
+    if pnl >= 0:
+        return None
+
+    dd_pct = abs(pnl) / allocation * 100.0
+    if dd_pct < max_dd_pct:
+        return None
+
+    block_reason = (
+        f"Max drawdown circuit breaker: bot DD {dd_pct:.1f}% "
+        f"exceeds limit {max_dd_pct:.1f}%. Auto-paused."
+    )
+    return {
+        "kind": "drawdown",
+        "drawdown_pct": round(dd_pct, 2),
+        "max_drawdown_pct": max_dd_pct,
+        "total_pnl": round(pnl, 2),
+        "reason": f"Drawdown {dd_pct:.1f}% / {max_dd_pct:.1f}%",
+        "block_reason": block_reason,
+    }
+
+
+def _streak_hold_cleared(cfg: dict, last_exit_dt: datetime | None) -> bool:
+    """True when resume (or explicit clear) acknowledged losses through last_exit."""
+    raw = cfg.get("streak_hold_cleared_at")
+    if raw is None or last_exit_dt is None:
+        return False
+    cleared_dt = _parse_event_ts(raw)
+    if cleared_dt is None:
+        return False
+    # Small epsilon so float/ISO round-trips still count as "at or after" last exit.
+    return cleared_dt.timestamp() + 1e-3 >= last_exit_dt.timestamp()
+
+
+def get_bot_entry_hold(bot: dict, *, total_pnl: float | None = None) -> dict | None:
+    """Active entry hold for UI — streak limit, post-loss cooloff, or max drawdown.
+
+    Cooloff is shown for RUNNING and PAUSED so a manual pause does not hide the timer.
+
+    Streak-limit is not a permanent ban: after ``loss_cooloff_sec`` from the last
+    exit (or a manual resume that sets ``streak_hold_cleared_at``), entries are
+    allowed again. Otherwise bots that hit the limit could never trade a winner
+    to clear the streak.
+    """
+    bot_id = bot.get("id", "")
+    status = str(bot.get("status") or "").upper()
+    if not bot_id or status not in ("RUNNING", "PAUSED"):
+        return None
+
+    cfg = RiskGate._parse_bot_config(bot)
+    max_streak = int(cfg.get("max_consecutive_losses", BOT_MAX_CONSECUTIVE_LOSSES))
+    cooloff_sec = int(cfg.get("loss_cooloff_sec", BOT_LOSS_COOLOFF_SEC))
+
+    from app.services.bots import analytics as bot_analytics
+
+    streak = bot_analytics.get_recent_consecutive_losses(bot_id)
+    last_exit_ts = bot_analytics.last_exit_timestamp(bot_id)
+    exit_dt = _parse_event_ts(last_exit_ts)
+
+    if _streak_hold_cleared(cfg, exit_dt):
+        return _compute_drawdown_hold(bot, total_pnl)
+
+    if max_streak > 0 and streak >= max_streak:
+        if cooloff_sec > 0 and exit_dt is not None:
+            elapsed = time.time() - exit_dt.timestamp()
+            if elapsed >= cooloff_sec:
+                # Cooloff elapsed — allow entries again (streak may still be high
+                # until a win; the next loss re-arms the hold).
+                return _compute_drawdown_hold(bot, total_pnl)
+            remaining = max(0, int(cooloff_sec - elapsed))
+            until = datetime.fromtimestamp(
+                exit_dt.timestamp() + cooloff_sec,
+                tz=timezone.utc,
+            )
+            block_reason = (
+                f"Consecutive-loss streak ({streak}) reached limit ({max_streak}). "
+                f"Entries blocked for {remaining}s — resume to clear early, or wait."
+            )
+            return {
+                "kind": "streak_limit",
+                "consecutive_losses": streak,
+                "max_consecutive_losses": max_streak,
+                "cooloff_sec": cooloff_sec,
+                "remaining_sec": remaining,
+                "cooloff_until": until.isoformat().replace("+00:00", "Z"),
+                "reason": f"Loss streak {streak}/{max_streak}",
+                "block_reason": block_reason,
+            }
+        block_reason = (
+            f"Consecutive-loss streak ({streak}) reached limit ({max_streak}). "
+            "Auto-paused — resume manually to clear the hold."
+        )
+        return {
+            "kind": "streak_limit",
+            "consecutive_losses": streak,
+            "max_consecutive_losses": max_streak,
+            "reason": f"Loss streak {streak}/{max_streak}",
+            "block_reason": block_reason,
+        }
+
+    if cooloff_sec > 0 and streak > 0 and exit_dt is not None:
+        elapsed = time.time() - exit_dt.timestamp()
+        if elapsed < cooloff_sec:
+            remaining = max(0, int(cooloff_sec - elapsed))
+            until = datetime.fromtimestamp(
+                exit_dt.timestamp() + cooloff_sec,
+                tz=timezone.utc,
+            )
+            block_reason = (
+                f"Cooling-off after loss: {remaining}s remaining "
+                f"(streak {streak}, cooloff {cooloff_sec}s)."
+            )
+            return {
+                "kind": "cooloff",
+                "consecutive_losses": streak,
+                "cooloff_sec": cooloff_sec,
+                "remaining_sec": remaining,
+                "cooloff_until": until.isoformat().replace("+00:00", "Z"),
+                "reason": (
+                    f"Cooling off after {streak} consecutive "
+                    f"loss{'es' if streak != 1 else ''}"
+                ),
+                "block_reason": block_reason,
+            }
+
+    return _compute_drawdown_hold(bot, total_pnl)
 
 
 class RiskGate:
@@ -237,67 +401,10 @@ class RiskGate:
     # ── Streak & cooling-off gate ──────────────────────────────────────────
 
     def _check_streak_and_cooloff(self, bot: dict) -> RiskDecision | None:
-        """Block entry if the bot is on a consecutive-loss streak or in cooling-off.
-
-        Configurable via BOT_MAX_CONSECUTIVE_LOSSES (default 5) and
-        BOT_LOSS_COOLOFF_SEC (default 300 = 5 min).
-        """
-        bot_id = bot.get("id", "")
-        if not bot_id:
-            return None
-
-        max_streak = int(
-            (bot.get("config") or {}).get(
-                "max_consecutive_losses", BOT_MAX_CONSECUTIVE_LOSSES
-            )
-        )
-        cooloff_sec = int(
-            (bot.get("config") or {}).get(
-                "loss_cooloff_sec", BOT_LOSS_COOLOFF_SEC
-            )
-        )
-
-        # Skip if disabled (0 = no limit)
-        if max_streak <= 0 and cooloff_sec <= 0:
-            return None
-
-        from app.services.bots import analytics as bot_analytics
-
-        streak = bot_analytics.get_recent_consecutive_losses(bot_id)
-
-        # Consecutive-loss gate
-        if max_streak > 0 and streak >= max_streak:
-            return RiskDecision(
-                False,
-                f"Consecutive-loss streak ({streak}) reached limit ({max_streak}). "
-                "Auto-paused — resume manually or wait for cooloff.",
-            )
-
-        # Cooling-off gate: after a losing exit, wait cooloff_sec before next entry
-        if cooloff_sec > 0 and streak > 0:
-            last_exit_ts = bot_analytics.last_exit_timestamp(bot_id)
-            if last_exit_ts:
-                import time
-                from datetime import datetime, timezone
-
-                try:
-                    if isinstance(last_exit_ts, str):
-                        if last_exit_ts.endswith("Z"):
-                            last_exit_ts = last_exit_ts[:-1] + "+00:00"
-                        dt = datetime.fromisoformat(last_exit_ts)
-                    else:
-                        dt = datetime.fromtimestamp(float(last_exit_ts), tz=timezone.utc)
-                    elapsed = time.time() - dt.timestamp()
-                    if elapsed < cooloff_sec:
-                        remaining = int(cooloff_sec - elapsed)
-                        return RiskDecision(
-                            False,
-                            f"Cooling-off after loss: {remaining}s remaining "
-                            f"(streak {streak}, cooloff {cooloff_sec}s).",
-                        )
-                except (TypeError, ValueError, OSError):
-                    pass
-
+        """Block entry if the bot is on a consecutive-loss streak or in cooling-off."""
+        hold = get_bot_entry_hold(bot)
+        if hold and hold.get("block_reason"):
+            return RiskDecision(False, hold["block_reason"])
         return None
 
     # ── Config helper ────────────────────────────────────────────────────
@@ -316,33 +423,10 @@ class RiskGate:
     # ── Max drawdown circuit breaker ──────────────────────────────────────
 
     def _check_max_drawdown(self, bot: dict) -> RiskDecision | None:
-        """Block entries if the bot's cumulative drawdown exceeds BOT_MAX_DRAWDOWN_PCT.
-
-        Looks at the bot's total PnL relative to its allocation.  If cumulative
-        losses exceed the configured percentage, the bot is paused.
-        """
-        bot_cfg = self._parse_bot_config(bot)
-        max_dd_pct = float(
-            bot_cfg.get("max_drawdown_pct", BOT_MAX_DRAWDOWN_PCT)
-        )
-        if max_dd_pct <= 0:
-            return None
-
-        allocation = float(bot.get("allocation") or 0)
-        if allocation <= 0:
-            return None
-
-        total_pnl = float(bot.get("total_pnl") or bot.get("pnl") or 0)
-        if total_pnl >= 0:
-            return None  # no drawdown
-
-        dd_pct = abs(total_pnl) / allocation * 100.0
-        if dd_pct >= max_dd_pct:
-            return RiskDecision(
-                False,
-                f"Max drawdown circuit breaker: bot DD {dd_pct:.1f}% "
-                f"exceeds limit {max_dd_pct:.1f}%. Auto-paused.",
-            )
+        """Block entries if the bot's cumulative drawdown exceeds BOT_MAX_DRAWDOWN_PCT."""
+        hold = _compute_drawdown_hold(bot)
+        if hold and hold.get("block_reason"):
+            return RiskDecision(False, hold["block_reason"])
         return None
 
     # ── Per-symbol bot concentration ─────────────────────────────────────
